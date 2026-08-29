@@ -6,7 +6,9 @@ configureDnsServers();
 
 const mongoose = require('mongoose');
 
-const { connectToDatabase } = require('../config/db');
+const {
+  connectToDatabase,
+} = require('../config/db');
 
 const User = require('../models/User');
 const Customer = require('../models/Customer');
@@ -14,7 +16,6 @@ const Transaction = require('../models/Transaction');
 const Subscription = require('../models/Subscription');
 const RecoveryCase = require('../models/RecoveryCase');
 const AuditLog = require('../models/AuditLog');
-
 
 const TEST_PREFIX = 'TEST-RR-';
 
@@ -26,7 +27,8 @@ const scenarios = [
     transactionStatus: 'FAILED',
     failureCategory: 'INSUFFICIENT_FUNDS',
     failureCode: 'INSUFFICIENT_FUNDS',
-    failureReason: 'Customer account has insufficient available funds.',
+    failureReason:
+      'Customer account has insufficient available funds.',
     failureStage: 'AUTHORIZATION',
     paymentMethod: 'CARD',
     caseType: 'PAYMENT_FAILURE',
@@ -45,7 +47,8 @@ const scenarios = [
     transactionStatus: 'FAILED',
     failureCategory: 'BANK_DECLINED',
     failureCode: 'BANK_DECLINED',
-    failureReason: 'Payment was declined by the issuing bank.',
+    failureReason:
+      'Payment was declined by the issuing bank.',
     failureStage: 'AUTHORIZATION',
     paymentMethod: 'CARD',
     caseType: 'PAYMENT_FAILURE',
@@ -64,7 +67,8 @@ const scenarios = [
     transactionStatus: 'FAILED',
     failureCategory: 'NETWORK_ERROR',
     failureCode: 'NETWORK_TIMEOUT',
-    failureReason: 'Payment provider request timed out.',
+    failureReason:
+      'Payment provider request timed out.',
     failureStage: 'AUTHORIZATION',
     paymentMethod: 'UPI',
     caseType: 'PAYMENT_FAILURE',
@@ -83,7 +87,8 @@ const scenarios = [
     transactionStatus: 'FAILED',
     failureCategory: 'AUTHENTICATION_FAILED',
     failureCode: 'AUTH_FAILED',
-    failureReason: 'Customer payment authentication was unsuccessful.',
+    failureReason:
+      'Customer payment authentication was unsuccessful.',
     failureStage: 'AUTHORIZATION',
     paymentMethod: 'CARD',
     caseType: 'PAYMENT_FAILURE',
@@ -102,7 +107,8 @@ const scenarios = [
     transactionStatus: 'FAILED',
     failureCategory: 'MANDATE_ERROR',
     failureCode: 'MANDATE_FAILED',
-    failureReason: 'Recurring payment mandate could not be processed.',
+    failureReason:
+      'Recurring payment mandate could not be processed.',
     failureStage: 'MANDATE',
     paymentMethod: 'NETBANKING',
     caseType: 'PAYMENT_FAILURE',
@@ -121,7 +127,8 @@ const scenarios = [
     transactionStatus: 'FAILED',
     failureCategory: 'UNKNOWN',
     failureCode: 'UNKNOWN_FAILURE',
-    failureReason: 'Payment provider returned an unknown failure.',
+    failureReason:
+      'Payment provider returned an unknown failure.',
     failureStage: 'UNKNOWN',
     paymentMethod: 'UPI',
     caseType: 'PAYMENT_FAILURE',
@@ -156,7 +163,8 @@ const scenarios = [
     transactionStatus: 'FAILED',
     failureCategory: 'INSUFFICIENT_FUNDS',
     failureCode: 'SUBSCRIPTION_FUNDS',
-    failureReason: 'Subscription renewal failed because funds were unavailable.',
+    failureReason:
+      'Subscription renewal failed because funds were unavailable.',
     failureStage: 'MANDATE',
     paymentMethod: 'CARD',
     caseType: 'SUBSCRIPTION_PAYMENT_FAILURE',
@@ -176,7 +184,8 @@ const scenarios = [
     transactionStatus: 'FAILED',
     failureCategory: 'NETWORK_ERROR',
     failureCode: 'RETRY_LIMIT_TEST',
-    failureReason: 'Payment has already reached the configured retry limit.',
+    failureReason:
+      'Payment has already reached the configured retry limit.',
     failureStage: 'AUTHORIZATION',
     paymentMethod: 'CARD',
     caseType: 'PAYMENT_FAILURE',
@@ -195,7 +204,8 @@ const scenarios = [
     transactionStatus: 'FAILED',
     failureCategory: 'INSUFFICIENT_FUNDS',
     failureCode: 'DUPLICATE_ACTION_TEST',
-    failureReason: 'Payment is already waiting for a delayed retry.',
+    failureReason:
+      'Payment is already waiting for a delayed retry.',
     failureStage: 'AUTHORIZATION',
     paymentMethod: 'CARD',
     caseType: 'PAYMENT_FAILURE',
@@ -215,7 +225,8 @@ const scenarios = [
     transactionStatus: 'FAILED',
     failureCategory: 'BANK_DECLINED',
     failureCode: 'EXPIRED_TEST',
-    failureReason: 'Recovery window has expired.',
+    failureReason:
+      'Recovery window has expired.',
     failureStage: 'AUTHORIZATION',
     paymentMethod: 'CARD',
     caseType: 'PAYMENT_FAILURE',
@@ -226,7 +237,8 @@ const scenarios = [
     reminderCount: 2,
     recoveryHours: -24,
     expectedAction: 'STOP',
-    stopReason: 'Recovery window expired without a verified payment result.',
+    stopReason:
+      'Recovery window expired without a verified payment result.',
   },
 
   {
@@ -245,16 +257,66 @@ const scenarios = [
     recovered: true,
     expectedAction: 'STOP',
   },
+
+  /*
+   * --------------------------------------------------
+   * 013 — ACTION EXECUTED TEST CASE
+   * --------------------------------------------------
+   *
+   * This case is intentionally left in ACTION_EXECUTED
+   * so the frontend payment-confirmation workflow can
+   * be tested:
+   *
+   * ACTION_EXECUTED
+   *      ↓
+   * Confirm Payment
+   *      ↓
+   * /api/recovery/confirm
+   *      ↓
+   * RECOVERED
+   *
+   * The case starts with recoveredAmountMinor = 0.
+   */
+
+  {
+    id: '013',
+    name: 'Payment retry awaiting confirmation',
+    transactionType: 'PAYMENT',
+    transactionStatus: 'FAILED',
+    failureCategory: 'NETWORK_ERROR',
+    failureCode: 'ACTION_EXECUTED_TEST',
+    failureReason:
+      'Payment retry was executed successfully and is awaiting payment confirmation.',
+    failureStage: 'AUTHORIZATION',
+    paymentMethod: 'CARD',
+    caseType: 'PAYMENT_FAILURE',
+    caseStatus: 'ACTION_EXECUTED',
+    currentAction: 'PAYMENT_RETRY',
+    amountMinor: 79900,
+    retryAttemptCount: 1,
+    reminderCount: 0,
+    recoveryHours: 48,
+    expectedAction: 'PAYMENT_RETRY',
+  },
 ];
 
-function buildProviderId(id, suffix) {
+function buildProviderId(
+  id,
+  suffix,
+) {
   return `${TEST_PREFIX}${id}-${suffix}`;
 }
 
 async function findMerchant() {
-  const merchant = await User.findOne({
-    role: { $in: ['OWNER', 'merchant'] },
-  }).select('_id');
+  const merchant =
+    await User.findOne({
+      role: {
+        $in: [
+          'OWNER',
+          'merchant',
+        ],
+      },
+    }).select('_id');
 
   if (!merchant) {
     throw new Error(
@@ -285,40 +347,41 @@ async function findOrCreateCustomer({
     return customer;
   }
 
-  customer = await Customer.create({
-    merchantId,
+  customer =
+    await Customer.create({
+      merchantId,
 
-    externalCustomerId,
+      externalCustomerId,
 
-    providerCustomerId:
-      buildProviderId(
-        scenario.id,
-        'PROVIDER_CUSTOMER',
-      ),
+      providerCustomerId:
+        buildProviderId(
+          scenario.id,
+          'PROVIDER_CUSTOMER',
+        ),
 
-    fullName:
-      `Recovery Test Customer ${scenario.id}`,
+      fullName:
+        `Recovery Test Customer ${scenario.id}`,
 
-    email:
-      `test-recovery-${scenario.id}@demo.local`,
+      email:
+        `test-recovery-${scenario.id}@demo.local`,
 
-    phone:
-      `90000000${scenario.id}`,
+      phone:
+        `90000000${scenario.id}`,
 
-    communicationConsent: {
-      email: true,
-      sms: true,
-      whatsapp: false,
-      updatedAt: new Date(),
-    },
+      communicationConsent: {
+        email: true,
+        sms: true,
+        whatsapp: false,
+        updatedAt: new Date(),
+      },
 
-    paymentHistory: {
-      successfulPaymentCount: 3,
-      failedPaymentCount: 1,
-      completedOrderCount: 3,
-      lifetimeValueMinor: 1500000,
-    },
-  });
+      paymentHistory: {
+        successfulPaymentCount: 3,
+        failedPaymentCount: 1,
+        completedOrderCount: 3,
+        lifetimeValueMinor: 1500000,
+      },
+    });
 
   return customer;
 }
@@ -366,27 +429,39 @@ async function findOrCreateSubscription({
       amountMinor:
         scenario.amountMinor,
 
-      currency: 'INR',
+      currency:
+        'INR',
 
-      intervalUnit: 'MONTH',
+      intervalUnit:
+        'MONTH',
 
-      intervalCount: 1,
+      intervalCount:
+        1,
 
-      failureCount: 1,
+      failureCount:
+        1,
 
       nextBillingAt:
         new Date(
           now.getTime() +
-            30 * 24 * 60 * 60 * 1000,
+            30 *
+              24 *
+              60 *
+              60 *
+              1000,
         ),
 
       recoveryWindowEndsAt:
         new Date(
           now.getTime() +
-            48 * 60 * 60 * 1000,
+            48 *
+              60 *
+              60 *
+              1000,
         ),
 
-      startedAt: now,
+      startedAt:
+        now,
     });
 
   return subscription;
@@ -423,7 +498,8 @@ async function findOrCreateTransaction({
       customerId,
 
       subscriptionId:
-        subscriptionId || undefined,
+        subscriptionId ||
+        undefined,
 
       type:
         scenario.transactionType,
@@ -434,9 +510,11 @@ async function findOrCreateTransaction({
       amountMinor:
         scenario.amountMinor,
 
-      currency: 'INR',
+      currency:
+        'INR',
 
-      source: 'MANUAL',
+      source:
+        'MANUAL',
 
       providerStatus:
         scenario.transactionStatus,
@@ -464,11 +542,14 @@ async function findOrCreateTransaction({
       paymentMethod:
         scenario.paymentMethod,
 
-      occurredAt: now,
+      occurredAt:
+        now,
 
-      providerCreatedAt: now,
+      providerCreatedAt:
+        now,
 
-      providerUpdatedAt: now,
+      providerUpdatedAt:
+        now,
     });
 
   return transaction;
@@ -505,7 +586,15 @@ async function findOrCreateRecoveryCase({
 
   const scheduled =
     scenario.caseStatus ===
-      'ACTION_SCHEDULED';
+    'ACTION_SCHEDULED';
+
+  /*
+   * For ACTION_EXECUTED scenario 013:
+   *
+   * nextActionAt is not needed because the action
+   * has already been executed and we are waiting
+   * for payment confirmation.
+   */
 
   const recoveryCaseData = {
     merchantId,
@@ -516,7 +605,8 @@ async function findOrCreateRecoveryCase({
       transactionId,
 
     subscriptionId:
-      subscriptionId || undefined,
+      subscriptionId ||
+      undefined,
 
     type:
       scenario.caseType,
@@ -535,7 +625,8 @@ async function findOrCreateRecoveryCase({
         ? scenario.amountMinor
         : 0,
 
-    currency: 'INR',
+    currency:
+      'INR',
 
     retryAttemptCount:
       scenario.retryAttemptCount,
@@ -550,7 +641,9 @@ async function findOrCreateRecoveryCase({
       scheduled
         ? new Date(
             now.getTime() +
-              60 * 60 * 1000,
+              60 *
+                60 *
+                1000,
           )
         : undefined,
 
@@ -585,14 +678,17 @@ async function findOrCreateRecoveryCase({
         scheduled
           ? new Date(
               now.getTime() +
-                60 * 60 * 1000,
+                60 *
+                  60 *
+                  1000,
             )
           : undefined,
 
       stopCondition:
         'MAX_RETRIES_OR_RECOVERY_WINDOW',
 
-      analyzedAt: now,
+      analyzedAt:
+        now,
     },
 
     stopReason:
@@ -642,7 +738,16 @@ async function createAuditLogIfMissing({
   let eventType =
     'RECOVERY_CASE_CREATED';
 
-  let result = 'INFO';
+  let result =
+    'INFO';
+
+  let action =
+    scenario.currentAction ||
+    null;
+
+  /*
+   * Historical terminal scenario.
+   */
 
   if (
     scenario.caseStatus ===
@@ -651,22 +756,63 @@ async function createAuditLogIfMissing({
     eventType =
       'RECOVERY_COMPLETED';
 
-    result = 'SUCCEEDED';
-  } else if (
+    result =
+      'SUCCEEDED';
+  }
+
+  /*
+   * Expired case.
+   */
+
+  else if (
     scenario.caseStatus ===
     'EXPIRED'
   ) {
     eventType =
       'RECOVERY_STOPPED';
 
-    result = 'SKIPPED';
-  } else if (
+    result =
+      'SKIPPED';
+
+    action =
+      'STOP';
+  }
+
+  /*
+   * ACTION_EXECUTED test case.
+   *
+   * This is intentionally PENDING because the
+   * action has executed but the payment has not
+   * yet been confirmed.
+   */
+
+  else if (
+    scenario.caseStatus ===
+    'ACTION_EXECUTED'
+  ) {
+    eventType =
+      'RECOVERY_ACTION_EXECUTED';
+
+    result =
+      'PENDING';
+
+    action =
+      scenario.currentAction;
+
+  }
+
+  /*
+   * Scheduled / pending recovery action.
+   */
+
+  else if (
     scenario.currentAction
   ) {
     eventType =
       'RECOVERY_ACTION_SELECTED';
 
-    result = 'PENDING';
+    result =
+      'PENDING';
   }
 
   return AuditLog.create({
@@ -682,8 +828,7 @@ async function createAuditLogIfMissing({
 
     eventType,
 
-    action:
-      scenario.currentAction,
+    action,
 
     result,
 
@@ -700,27 +845,38 @@ async function createAuditLogIfMissing({
       failureCategory:
         scenario.failureCategory ||
         'NONE',
+
+      caseStatus:
+        scenario.caseStatus,
+
+      currentAction:
+        scenario.currentAction ||
+        null,
     },
 
     externalEventId,
 
-    occurredAt: new Date(),
+    occurredAt:
+      new Date(),
   });
 }
 
 async function seedRecoveryTestData() {
-await connectToDatabase();
+  await connectToDatabase();
 
   const merchant =
     await findMerchant();
 
   const created = [];
 
-  for (const scenario of scenarios) {
+  for (
+    const scenario of scenarios
+  ) {
     const customer =
       await findOrCreateCustomer({
         merchantId:
           merchant._id,
+
         scenario,
       });
 
@@ -728,8 +884,10 @@ await connectToDatabase();
       await findOrCreateSubscription({
         merchantId:
           merchant._id,
+
         customerId:
           customer._id,
+
         scenario,
       });
 
@@ -737,10 +895,13 @@ await connectToDatabase();
       await findOrCreateTransaction({
         merchantId:
           merchant._id,
+
         customerId:
           customer._id,
+
         subscriptionId:
           subscription?._id,
+
         scenario,
       });
 
@@ -748,21 +909,32 @@ await connectToDatabase();
       await findOrCreateRecoveryCase({
         merchantId:
           merchant._id,
+
         customerId:
           customer._id,
+
         transactionId:
           transaction._id,
+
         subscriptionId:
           subscription?._id,
+
         scenario,
       });
+
+    /*
+     * Keep transaction -> recovery case relationship
+     * synchronized.
+     */
 
     if (
       !transaction.recoveryCaseId ||
       String(
         transaction.recoveryCaseId,
       ) !==
-        String(recoveryCase._id)
+        String(
+          recoveryCase._id,
+        )
     ) {
       transaction.recoveryCaseId =
         recoveryCase._id;
@@ -770,13 +942,20 @@ await connectToDatabase();
       await transaction.save();
     }
 
+    /*
+     * Keep subscription -> recovery case relationship
+     * synchronized.
+     */
+
     if (subscription) {
       if (
         !subscription.activeRecoveryCaseId ||
         String(
           subscription.activeRecoveryCaseId,
         ) !==
-          String(recoveryCase._id)
+          String(
+            recoveryCase._id,
+          )
       ) {
         subscription.activeRecoveryCaseId =
           recoveryCase._id;
@@ -808,10 +987,14 @@ await connectToDatabase();
         scenario.name,
 
       recoveryCaseId:
-        String(recoveryCase._id),
+        String(
+          recoveryCase._id,
+        ),
 
       transactionId:
-        String(transaction._id),
+        String(
+          transaction._id,
+        ),
 
       status:
         recoveryCase.status,
@@ -833,12 +1016,15 @@ await connectToDatabase();
     JSON.stringify(
       {
         merchantId:
-          String(merchant._id),
+          String(
+            merchant._id,
+          ),
 
         scenarios:
           created.length,
 
-        cases: created,
+        cases:
+          created,
       },
       null,
       2,

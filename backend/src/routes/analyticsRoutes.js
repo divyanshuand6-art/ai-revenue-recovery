@@ -1,7 +1,7 @@
 const express = require('express');
 
 const {
-  getRecoveryAnalyticsController,
+  getDashboardAnalytics,
 } = require('../controllers/analyticsController');
 
 const {
@@ -10,10 +10,11 @@ const {
 
 const router = express.Router();
 
+router.use(requireAuth);
+
 router.get(
-  '/recovery',
-  requireAuth,
-  getRecoveryAnalyticsController,
+  '/dashboard',
+  getDashboardAnalytics,
 );
 
 module.exports = router;

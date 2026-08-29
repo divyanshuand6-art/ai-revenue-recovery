@@ -1,6 +1,12 @@
 const RecoveryCase = require('../models/RecoveryCase');
 const AuditLog = require('../models/AuditLog');
 
+/*
+ * --------------------------------------------------
+ * EXECUTABLE ACTIONS
+ * --------------------------------------------------
+ */
+
 const EXECUTABLE_ACTIONS = Object.freeze([
   'PAYMENT_RETRY',
   'DELAYED_RETRY',
@@ -12,6 +18,14 @@ const EXECUTABLE_ACTIONS = Object.freeze([
   'STOP',
 ]);
 
+/*
+ * --------------------------------------------------
+ * TERMINAL STATUSES
+ * --------------------------------------------------
+ *
+ * A terminal case must never be executed again.
+ */
+
 const TERMINAL_STATUSES = Object.freeze([
   'RECOVERED',
   'FAILED',
@@ -19,6 +33,14 @@ const TERMINAL_STATUSES = Object.freeze([
   'EXPIRED',
   'STOPPED',
 ]);
+
+/*
+ * --------------------------------------------------
+ * NORMALIZE AUDIT METADATA
+ * --------------------------------------------------
+ *
+ * AuditLog metadata is stored as strings.
+ */
 
 function createAuditMetadata(data = {}) {
   return Object.fromEntries(
@@ -35,6 +57,12 @@ function createAuditMetadata(data = {}) {
   );
 }
 
+/*
+ * --------------------------------------------------
+ * CREATE AUDIT LOG
+ * --------------------------------------------------
+ */
+
 async function createRecoveryAuditLog({
   recoveryCase,
   eventType,
@@ -44,14 +72,17 @@ async function createRecoveryAuditLog({
   metadata = {},
 }) {
   return AuditLog.create({
-    merchantId: recoveryCase.merchantId,
+    merchantId:
+      recoveryCase.merchantId,
 
-    recoveryCaseId: recoveryCase._id,
+    recoveryCaseId:
+      recoveryCase._id,
 
     transactionId:
       recoveryCase.sourceTransactionId,
 
-    actorType: 'RECOVERY_ENGINE',
+    actorType:
+      'RECOVERY_ENGINE',
 
     eventType,
 
@@ -66,22 +97,44 @@ async function createRecoveryAuditLog({
   });
 }
 
+/*
+ * --------------------------------------------------
+ * EXECUTE RECOVERY ACTION
+ * --------------------------------------------------
+ */
+
 async function executeRecoveryAction({
   recoveryCaseId,
   action,
   reason,
 }) {
+  /*
+   * --------------------------------------------------
+   * 1. BASIC VALIDATION
+   * --------------------------------------------------
+   */
+
   if (!recoveryCaseId) {
     throw new Error(
       'recoveryCaseId is required.',
     );
   }
 
-  if (!EXECUTABLE_ACTIONS.includes(action)) {
+  if (
+    !EXECUTABLE_ACTIONS.includes(
+      action,
+    )
+  ) {
     throw new Error(
       `Unsupported recovery action: ${action}`,
     );
   }
+
+  /*
+   * --------------------------------------------------
+   * 2. LOAD RECOVERY CASE
+   * --------------------------------------------------
+   */
 
   const recoveryCase =
     await RecoveryCase.findById(
@@ -96,8 +149,11 @@ async function executeRecoveryAction({
 
   /*
    * --------------------------------------------------
-   * TERMINAL CASE PROTECTION
+   * 3. TERMINAL CASE PROTECTION
    * --------------------------------------------------
+   *
+   * Already recovered / failed / escalated /
+   * expired / stopped cases cannot be processed again.
    */
 
   if (
@@ -111,15 +167,18 @@ async function executeRecoveryAction({
       eventType:
         'RECOVERY_STOPPED',
 
-      action: 'STOP',
+      action:
+        'STOP',
 
-      result: 'SKIPPED',
+      result:
+        'SKIPPED',
 
       message:
         `Recovery action ${action} was blocked because the case is already ${recoveryCase.status}.`,
 
       metadata: {
-        requestedAction: action,
+        requestedAction:
+          action,
 
         existingStatus:
           recoveryCase.status,
@@ -131,7 +190,8 @@ async function executeRecoveryAction({
 
       blocked: true,
 
-      action: 'STOP',
+      action:
+        'STOP',
 
       reason:
         `Recovery case is already ${recoveryCase.status}.`,
@@ -143,61 +203,11 @@ async function executeRecoveryAction({
 
   /*
    * --------------------------------------------------
-   * DUPLICATE SCHEDULED ACTION PROTECTION
+   * 4. STOP
    * --------------------------------------------------
-   */
-
-  if (
-    recoveryCase.status ===
-      'ACTION_SCHEDULED' &&
-    recoveryCase.currentAction
-  ) {
-    await createRecoveryAuditLog({
-      recoveryCase,
-
-      eventType:
-        'POLICY_REJECTED',
-
-      action:
-        recoveryCase.currentAction,
-
-      result:
-        'REJECTED',
-
-      message:
-        `Recovery action ${action} was rejected because ${recoveryCase.currentAction} is already scheduled.`,
-
-      metadata: {
-        requestedAction: action,
-
-        existingAction:
-          recoveryCase.currentAction,
-
-        status:
-          recoveryCase.status,
-      },
-    });
-
-    return {
-      executed: false,
-
-      blocked: true,
-
-      action:
-        recoveryCase.currentAction,
-
-      reason:
-        'An action is already scheduled for this recovery case.',
-
-      status:
-        recoveryCase.status,
-    };
-  }
-
-  /*
-   * --------------------------------------------------
-   * STOP
-   * --------------------------------------------------
+   *
+   * STOP is an actual successful state transition
+   * when the case is not already terminal.
    */
 
   if (action === 'STOP') {
@@ -222,10 +232,17 @@ async function executeRecoveryAction({
       eventType:
         'RECOVERY_STOPPED',
 
-      action: 'STOP',
+      action:
+        'STOP',
 
+      /*
+       * IMPORTANT:
+       *
+       * This STOP was actually executed.
+       * Therefore it must NOT be SKIPPED.
+       */
       result:
-        'SKIPPED',
+        'SUCCEEDED',
 
       message:
         reason ||
@@ -241,15 +258,22 @@ async function executeRecoveryAction({
 
       blocked: false,
 
-      action: 'STOP',
+      action:
+        'STOP',
 
-      status: 'STOPPED',
+      status:
+        'STOPPED',
+
+      recovered: false,
+
+      message:
+        'Recovery workflow stopped successfully.',
     };
   }
 
   /*
    * --------------------------------------------------
-   * ESCALATE
+   * 5. ESCALATE
    * --------------------------------------------------
    */
 
@@ -279,7 +303,7 @@ async function executeRecoveryAction({
         'ESCALATE',
 
       result:
-        'PENDING',
+        'SUCCEEDED',
 
       message:
         reason ||
@@ -300,20 +324,85 @@ async function executeRecoveryAction({
 
       status:
         'ESCALATED',
+
+      recovered: false,
+
+      message:
+        'Recovery case escalated successfully.',
     };
   }
 
   /*
    * --------------------------------------------------
-   * NORMAL BOUNDED RECOVERY ACTION
+   * 6. DUPLICATE SCHEDULED ACTION PROTECTION
    * --------------------------------------------------
    *
-   * IMPORTANT:
+   * A case that already has a scheduled action should
+   * not receive another automatic action of a different
+   * type.
    *
-   * Executing an action does NOT mean that money
-   * has been recovered.
+   * STOP and ESCALATE are handled above because they
+   * intentionally change the case state.
+   */
+
+  if (
+    recoveryCase.status ===
+      'ACTION_SCHEDULED' &&
+    recoveryCase.currentAction
+  ) {
+    await createRecoveryAuditLog({
+      recoveryCase,
+
+      eventType:
+        'POLICY_REJECTED',
+
+      action:
+        recoveryCase.currentAction,
+
+      result:
+        'REJECTED',
+
+      message:
+        `Recovery action ${action} was rejected because ${recoveryCase.currentAction} is already scheduled.`,
+
+      metadata: {
+        requestedAction:
+          action,
+
+        existingAction:
+          recoveryCase.currentAction,
+
+        status:
+          recoveryCase.status,
+      },
+    });
+
+    return {
+      executed: false,
+
+      blocked: true,
+
+      action:
+        recoveryCase.currentAction,
+
+      reason:
+        'An action is already scheduled for this recovery case.',
+
+      status:
+        recoveryCase.status,
+    };
+  }
+
+  /*
+   * --------------------------------------------------
+   * 7. NORMAL BOUNDED RECOVERY ACTION
+   * --------------------------------------------------
    *
-   * Payment confirmation happens separately.
+   * Executing the recovery action does NOT prove
+   * that money has been recovered.
+   *
+   * The provider/payment confirmation endpoint
+   * must confirm the successful payment separately.
    */
 
   const previousStatus =
@@ -370,7 +459,7 @@ async function executeRecoveryAction({
     action,
 
     status:
-      recoveryCase.status,
+      'ACTION_EXECUTED',
 
     recovered: false,
 
@@ -378,6 +467,12 @@ async function executeRecoveryAction({
       'Recovery action recorded. Payment recovery must be confirmed separately.',
   };
 }
+
+/*
+ * --------------------------------------------------
+ * EXPORT
+ * --------------------------------------------------
+ */
 
 module.exports = {
   executeRecoveryAction,

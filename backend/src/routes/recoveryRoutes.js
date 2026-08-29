@@ -1,6 +1,9 @@
 const express = require('express');
 
 const {
+  getRecoveryCases,
+  getRecoveryCaseTimeline,
+  runAIRecoveryAnalysisController,
   decideAndExecuteRecovery,
   confirmRecoveryController,
 } = require('../controllers/recoveryController');
@@ -11,26 +14,30 @@ const {
 
 const router = express.Router();
 
-/*
- * Decide which recovery action should be taken
- * and execute that bounded action.
- *
- * POST /api/recovery/execute
- */
+router.use(requireAuth);
+
+router.get(
+  '/cases',
+  getRecoveryCases,
+);
+
+router.get(
+  '/cases/:recoveryCaseId/timeline',
+  getRecoveryCaseTimeline,
+);
+
+router.post(
+  '/ai-analysis',
+  runAIRecoveryAnalysisController,
+);
+
 router.post(
   '/execute',
-  requireAuth,
   decideAndExecuteRecovery,
 );
 
-/*
- * Confirm that a payment actually recovered money.
- *
- * POST /api/recovery/confirm
- */
 router.post(
   '/confirm',
-  requireAuth,
   confirmRecoveryController,
 );
 
