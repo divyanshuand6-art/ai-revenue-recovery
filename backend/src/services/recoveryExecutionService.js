@@ -1,48 +1,67 @@
 const RecoveryCase = require('../models/RecoveryCase');
 const AuditLog = require('../models/AuditLog');
 
+const {
+  createRecoveryPaymentLink,
+} = require('./razorpayRecoveryService');
+
 /*
- * --------------------------------------------------
+ * ============================================================
  * EXECUTABLE ACTIONS
- * --------------------------------------------------
+ * ============================================================
  */
 
-const EXECUTABLE_ACTIONS = Object.freeze([
-  'PAYMENT_RETRY',
-  'DELAYED_RETRY',
-  'RECOVERY_LINK',
-  'ALTERNATIVE_PAYMENT',
-  'REMINDER',
-  'FOLLOW_UP',
-  'ESCALATE',
-  'STOP',
-]);
+const EXECUTABLE_ACTIONS =
+  Object.freeze([
+    'PAYMENT_RETRY',
+    'DELAYED_RETRY',
+    'RECOVERY_LINK',
+    'ALTERNATIVE_PAYMENT',
+    'REMINDER',
+    'FOLLOW_UP',
+    'ESCALATE',
+    'STOP',
+  ]);
 
 /*
- * --------------------------------------------------
+ * ============================================================
+ * CUSTOMER PAYMENT-LINK ACTIONS
+ * ============================================================
+ */
+
+const PAYMENT_LINK_ACTIONS =
+  new Set([
+    'RECOVERY_LINK',
+    'ALTERNATIVE_PAYMENT',
+    'REMINDER',
+    'PAYMENT_RETRY',
+    'DELAYED_RETRY',
+  ]);
+
+/*
+ * ============================================================
  * TERMINAL STATUSES
- * --------------------------------------------------
- *
- * A terminal case must never be executed again.
+ * ============================================================
  */
 
-const TERMINAL_STATUSES = Object.freeze([
-  'RECOVERED',
-  'FAILED',
-  'ESCALATED',
-  'EXPIRED',
-  'STOPPED',
-]);
+const TERMINAL_STATUSES =
+  Object.freeze([
+    'RECOVERED',
+    'FAILED',
+    'ESCALATED',
+    'EXPIRED',
+    'STOPPED',
+  ]);
 
 /*
- * --------------------------------------------------
- * NORMALIZE AUDIT METADATA
- * --------------------------------------------------
- *
- * AuditLog metadata is stored as strings.
+ * ============================================================
+ * AUDIT METADATA
+ * ============================================================
  */
 
-function createAuditMetadata(data = {}) {
+function createAuditMetadata(
+  data = {},
+) {
   return Object.fromEntries(
     Object.entries(data)
       .filter(
@@ -58,9 +77,9 @@ function createAuditMetadata(data = {}) {
 }
 
 /*
- * --------------------------------------------------
- * CREATE AUDIT LOG
- * --------------------------------------------------
+ * ============================================================
+ * AUDIT
+ * ============================================================
  */
 
 async function createRecoveryAuditLog({
@@ -93,14 +112,16 @@ async function createRecoveryAuditLog({
     message,
 
     metadata:
-      createAuditMetadata(metadata),
+      createAuditMetadata(
+        metadata,
+      ),
   });
 }
 
 /*
- * --------------------------------------------------
+ * ============================================================
  * EXECUTE RECOVERY ACTION
- * --------------------------------------------------
+ * ============================================================
  */
 
 async function executeRecoveryAction({
@@ -109,9 +130,9 @@ async function executeRecoveryAction({
   reason,
 }) {
   /*
-   * --------------------------------------------------
+   * ----------------------------------------------------------
    * 1. BASIC VALIDATION
-   * --------------------------------------------------
+   * ----------------------------------------------------------
    */
 
   if (!recoveryCaseId) {
@@ -131,9 +152,9 @@ async function executeRecoveryAction({
   }
 
   /*
-   * --------------------------------------------------
-   * 2. LOAD RECOVERY CASE
-   * --------------------------------------------------
+   * ----------------------------------------------------------
+   * 2. LOAD CASE
+   * ----------------------------------------------------------
    */
 
   const recoveryCase =
@@ -148,12 +169,9 @@ async function executeRecoveryAction({
   }
 
   /*
-   * --------------------------------------------------
-   * 3. TERMINAL CASE PROTECTION
-   * --------------------------------------------------
-   *
-   * Already recovered / failed / escalated /
-   * expired / stopped cases cannot be processed again.
+   * ----------------------------------------------------------
+   * 3. TERMINAL PROTECTION
+   * ----------------------------------------------------------
    */
 
   if (
@@ -202,12 +220,9 @@ async function executeRecoveryAction({
   }
 
   /*
-   * --------------------------------------------------
+   * ----------------------------------------------------------
    * 4. STOP
-   * --------------------------------------------------
-   *
-   * STOP is an actual successful state transition
-   * when the case is not already terminal.
+   * ----------------------------------------------------------
    */
 
   if (action === 'STOP') {
@@ -224,6 +239,9 @@ async function executeRecoveryAction({
       reason ||
       'Recovery workflow stopped by policy.';
 
+    recoveryCase.nextActionAt =
+      null;
+
     await recoveryCase.save();
 
     await createRecoveryAuditLog({
@@ -235,12 +253,6 @@ async function executeRecoveryAction({
       action:
         'STOP',
 
-      /*
-       * IMPORTANT:
-       *
-       * This STOP was actually executed.
-       * Therefore it must NOT be SKIPPED.
-       */
       result:
         'SUCCEEDED',
 
@@ -266,15 +278,18 @@ async function executeRecoveryAction({
 
       recovered: false,
 
+      awaitingPaymentConfirmation:
+        false,
+
       message:
         'Recovery workflow stopped successfully.',
     };
   }
 
   /*
-   * --------------------------------------------------
+   * ----------------------------------------------------------
    * 5. ESCALATE
-   * --------------------------------------------------
+   * ----------------------------------------------------------
    */
 
   if (action === 'ESCALATE') {
@@ -290,6 +305,9 @@ async function executeRecoveryAction({
     recoveryCase.escalationReason =
       reason ||
       'Recovery requires manual intervention.';
+
+    recoveryCase.nextActionAt =
+      null;
 
     await recoveryCase.save();
 
@@ -327,22 +345,18 @@ async function executeRecoveryAction({
 
       recovered: false,
 
+      awaitingPaymentConfirmation:
+        false,
+
       message:
         'Recovery case escalated successfully.',
     };
   }
 
   /*
-   * --------------------------------------------------
-   * 6. DUPLICATE SCHEDULED ACTION PROTECTION
-   * --------------------------------------------------
-   *
-   * A case that already has a scheduled action should
-   * not receive another automatic action of a different
-   * type.
-   *
-   * STOP and ESCALATE are handled above because they
-   * intentionally change the case state.
+   * ----------------------------------------------------------
+   * 6. DUPLICATE SCHEDULED ACTION
+   * ----------------------------------------------------------
    */
 
   if (
@@ -394,15 +408,293 @@ async function executeRecoveryAction({
   }
 
   /*
-   * --------------------------------------------------
-   * 7. NORMAL BOUNDED RECOVERY ACTION
-   * --------------------------------------------------
+   * ----------------------------------------------------------
+   * 7. ALREADY EXECUTED
+   * ----------------------------------------------------------
+   */
+
+  if (
+    recoveryCase.status ===
+    'ACTION_EXECUTED'
+  ) {
+    await createRecoveryAuditLog({
+      recoveryCase,
+
+      eventType:
+        'POLICY_REJECTED',
+
+      action:
+        recoveryCase.currentAction ||
+        action,
+
+      result:
+        'REJECTED',
+
+      message:
+        'Recovery action has already been executed and is awaiting payment confirmation.',
+
+      metadata: {
+        requestedAction:
+          action,
+
+        existingAction:
+          recoveryCase.currentAction,
+
+        status:
+          recoveryCase.status,
+      },
+    });
+
+    return {
+      executed: false,
+
+      blocked: true,
+
+      action:
+        recoveryCase.currentAction ||
+        action,
+
+      reason:
+        'Recovery action has already been executed and is awaiting payment confirmation.',
+
+      status:
+        recoveryCase.status,
+
+      awaitingPaymentConfirmation:
+        true,
+    };
+  }
+
+  /*
+   * ----------------------------------------------------------
+   * 8. CUSTOMER PAYMENT FLOW
+   * ----------------------------------------------------------
    *
-   * Executing the recovery action does NOT prove
-   * that money has been recovered.
+   * IMPORTANT:
    *
-   * The provider/payment confirmation endpoint
-   * must confirm the successful payment separately.
+   * We DO NOT save ACTION_EXECUTED before creating the
+   * Razorpay payment link.
+   *
+   * This prevents:
+   *
+   * ACTION_EXECUTED
+   *      ↓
+   * Razorpay 429
+   *      ↓
+   * false-looking execution history
+   *
+   * Instead:
+   *
+   * Razorpay link
+   *      ↓
+   * success
+   *      ↓
+   * ACTION_EXECUTED
+   */
+
+  if (
+    PAYMENT_LINK_ACTIONS.has(
+      action,
+    )
+  ) {
+    let paymentLink;
+
+    try {
+      /*
+       * Create/reuse Razorpay link while the case is still
+       * in the original state.
+       */
+      paymentLink =
+        await createRecoveryPaymentLink({
+          recoveryCaseId:
+            recoveryCase._id,
+
+          merchantId:
+            recoveryCase.merchantId,
+
+          action,
+
+          allowPendingExecution:
+            true,
+        });
+    } catch (error) {
+      /*
+       * No ACTION_EXECUTED state has been committed yet.
+       *
+       * Therefore no rollback is required.
+       */
+
+      await createRecoveryAuditLog({
+        recoveryCase,
+
+        eventType:
+          'POLICY_REJECTED',
+
+        action,
+
+        result:
+          'FAILED',
+
+        message:
+          `Recovery action ${action} could not be completed because the Razorpay payment link could not be created.`,
+
+        metadata: {
+          previousStatus:
+            recoveryCase.status,
+
+          razorpayError:
+            error.message,
+        },
+      });
+
+      throw new Error(
+        `Recovery action ${action} could not be completed: ${error.message}`,
+      );
+    }
+
+    /*
+     * --------------------------------------------------------
+     * 8A. LINK SUCCESS → COMMIT ACTION_EXECUTED
+     * --------------------------------------------------------
+     */
+
+    const previousStatus =
+      recoveryCase.status;
+
+    recoveryCase.status =
+      'ACTION_EXECUTED';
+
+    recoveryCase.currentAction =
+      action;
+
+    recoveryCase.nextActionAt =
+      null;
+
+    if (
+      action ===
+        'PAYMENT_RETRY' ||
+      action ===
+        'DELAYED_RETRY'
+    ) {
+      recoveryCase.retryAttemptCount =
+        Number(
+          recoveryCase.retryAttemptCount ||
+            0,
+        ) + 1;
+    }
+
+    await recoveryCase.save();
+
+    /*
+     * --------------------------------------------------------
+     * 8B. ACTION EXECUTED AUDIT
+     * --------------------------------------------------------
+     */
+
+    await createRecoveryAuditLog({
+      recoveryCase,
+
+      eventType:
+        'RECOVERY_ACTION_EXECUTED',
+
+      action,
+
+      result:
+        'PENDING',
+
+      message:
+        reason ||
+        `Recovery action ${action} executed and is awaiting payment confirmation.`,
+
+      metadata: {
+        previousStatus,
+
+        amountAtRiskMinor:
+          recoveryCase.amountAtRiskMinor,
+
+        eligibleAmountMinor:
+          recoveryCase.eligibleAmountMinor,
+
+        recoveredAmountMinor:
+          recoveryCase.recoveredAmountMinor,
+
+        retryAttemptCount:
+          recoveryCase.retryAttemptCount,
+
+        reminderCount:
+          recoveryCase.reminderCount,
+
+        customerFacingAction:
+          true,
+
+        paymentLinkCreated:
+          true,
+      },
+    });
+
+    return {
+      executed: true,
+
+      blocked: false,
+
+      action,
+
+      status:
+        'ACTION_EXECUTED',
+
+      recovered: false,
+
+      awaitingPaymentConfirmation:
+        true,
+
+      customerOutreach: true,
+
+      paymentLink: {
+        created:
+          paymentLink.created,
+
+        reused:
+          paymentLink.reused,
+
+        paymentLinkId:
+          paymentLink.paymentLinkId,
+
+        paymentLinkUrl:
+          paymentLink.paymentLinkUrl,
+
+        status:
+          paymentLink.status,
+
+        amountMinor:
+          paymentLink.amountMinor,
+
+        currency:
+          paymentLink.currency,
+
+        referenceId:
+          paymentLink.referenceId,
+
+        expiresAt:
+          paymentLink.expiresAt,
+
+        notification:
+          paymentLink.notification,
+      },
+
+      message:
+        'Recovery action executed and Razorpay payment link created. Revenue will be counted as recovered only after successful payment confirmation.',
+    };
+  }
+
+  /*
+   * ----------------------------------------------------------
+   * 9. NON-CUSTOMER ACTIONS
+   * ----------------------------------------------------------
+   *
+   * FOLLOW_UP currently records the action only.
+   *
+   * It does not create a payment link and does not mark
+   * the customer as recovered.
    */
 
   const previousStatus =
@@ -413,6 +705,9 @@ async function executeRecoveryAction({
 
   recoveryCase.currentAction =
     action;
+
+  recoveryCase.nextActionAt =
+    null;
 
   await recoveryCase.save();
 
@@ -443,11 +738,8 @@ async function executeRecoveryAction({
       recoveredAmountMinor:
         recoveryCase.recoveredAmountMinor,
 
-      retryAttemptCount:
-        recoveryCase.retryAttemptCount,
-
-      reminderCount:
-        recoveryCase.reminderCount,
+      customerFacingAction:
+        false,
     },
   });
 
@@ -463,16 +755,17 @@ async function executeRecoveryAction({
 
     recovered: false,
 
+    awaitingPaymentConfirmation:
+      true,
+
+    customerOutreach: false,
+
+    paymentLink: null,
+
     message:
-      'Recovery action recorded. Payment recovery must be confirmed separately.',
+      'Recovery action recorded. Revenue will be counted as recovered only after successful payment confirmation.',
   };
 }
-
-/*
- * --------------------------------------------------
- * EXPORT
- * --------------------------------------------------
- */
 
 module.exports = {
   executeRecoveryAction,

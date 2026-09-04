@@ -4,8 +4,22 @@ const Customer = require('../models/Customer');
 const AuditLog = require('../models/AuditLog');
 
 const {
-  decideRecoveryAction,
+  getRecoveryPolicyConstraints,
 } = require('./recoveryDecisionService');
+
+const {
+  validateAIRecommendation,
+} = require('./aiRecommendationValidationService');
+
+const {
+  processRecoveryCasesInBatches,
+} = require('./aiLargeBatchProcessor_true_batch');
+
+/*
+ * --------------------------------------------------
+ * AI CONFIGURATION
+ * --------------------------------------------------
+ */
 
 const AI_MODEL =
   process.env.GEMINI_MODEL ||
@@ -14,6 +28,12 @@ const AI_MODEL =
 const GEMINI_API_KEY =
   process.env.GEMINI_API_KEY ||
   process.env.GOOGLE_API_KEY;
+
+/*
+ * --------------------------------------------------
+ * EXECUTABLE ACTIONS
+ * --------------------------------------------------
+ */
 
 const EXECUTABLE_ACTIONS = Object.freeze([
   'PAYMENT_RETRY',
@@ -26,6 +46,12 @@ const EXECUTABLE_ACTIONS = Object.freeze([
   'STOP',
 ]);
 
+/*
+ * --------------------------------------------------
+ * HELPERS
+ * --------------------------------------------------
+ */
+
 function createAuditMetadata(data = {}) {
   return Object.fromEntries(
     Object.entries(data)
@@ -36,7 +62,9 @@ function createAuditMetadata(data = {}) {
       )
       .map(([key, value]) => [
         key,
-        String(value),
+        typeof value === 'string'
+          ? value
+          : JSON.stringify(value),
       ]),
   );
 }
@@ -56,6 +84,12 @@ function toNumber(value, fallback = 0) {
     : fallback;
 }
 
+/*
+ * --------------------------------------------------
+ * CLEAN GEMINI JSON
+ * --------------------------------------------------
+ */
+
 function cleanJsonText(text) {
   return String(text || '')
     .replace(/^```json\s*/i, '')
@@ -63,6 +97,12 @@ function cleanJsonText(text) {
     .replace(/\s*```$/i, '')
     .trim();
 }
+
+/*
+ * --------------------------------------------------
+ * PARSE GEMINI RESPONSE
+ * --------------------------------------------------
+ */
 
 function parseAIResponse(text) {
   const cleaned =
@@ -72,10 +112,11 @@ function parseAIResponse(text) {
     return JSON.parse(cleaned);
   } catch {
     /*
-     * Sometimes the model adds explanatory
-     * text around the JSON. Extract the first
+     * Sometimes the model adds explanatory text
+     * around the JSON. Try to extract the first
      * JSON object.
      */
+
     const start =
       cleaned.indexOf('{');
 
@@ -100,9 +141,13 @@ function parseAIResponse(text) {
   }
 }
 
-function normalizeAIRecommendation(
-  raw,
-) {
+/*
+ * --------------------------------------------------
+ * NORMALIZE AI RECOMMENDATION
+ * --------------------------------------------------
+ */
+
+function normalizeAIRecommendation(raw) {
   const action = String(
     raw?.action || '',
   )
@@ -143,358 +188,102 @@ function normalizeAIRecommendation(
     'HIGH',
   ];
 
-  return {
-    action,
+  const normalizedRisk =
+    allowedRiskLevels.includes(
+      riskLevel,
+    )
+      ? riskLevel
+      : 'MEDIUM';
 
-    confidence: Number(
-      confidence.toFixed(2),
-    ),
+  const reason =
+    String(
+      raw?.reason ||
+        raw?.rationale ||
+        raw?.explanation ||
+        '',
+    ).trim();
 
-    riskLevel:
-      allowedRiskLevels.includes(
-        riskLevel,
-      )
-        ? riskLevel
-        : 'MEDIUM',
+  const customerMessage =
+    String(
+      raw?.customerMessage ||
+        raw?.customer_message ||
+        '',
+    ).trim();
 
-    reason:
-      String(
-        raw?.reason ||
-          'No explanation was provided.',
-      ).trim(),
+  const stopCondition =
+    String(
+      raw?.stopCondition ||
+        raw?.stop_condition ||
+        '',
+    ).trim();
 
-    provider: 'GEMINI',
-  };
-}
-
-function buildAIInput({
-  recoveryCase,
-  transaction,
-  customer,
-}) {
-  return {
-    recoveryCase: {
-      id: String(
-        recoveryCase._id,
-      ),
-
-      type:
-        recoveryCase.type,
-
-      status:
-        recoveryCase.status,
-
-      amountAtRiskMinor:
-        recoveryCase.amountAtRiskMinor,
-
-      eligibleAmountMinor:
-        recoveryCase.eligibleAmountMinor,
-
-      recoveredAmountMinor:
-        recoveryCase.recoveredAmountMinor,
-
-      retryAttemptCount:
-        recoveryCase.retryAttemptCount,
-
-      reminderCount:
-        recoveryCase.reminderCount,
-
-      currentAction:
-        recoveryCase.currentAction,
-
-      recoveryWindowEndsAt:
-        recoveryCase.recoveryWindowEndsAt,
-
-      policySnapshot:
-        recoveryCase.policySnapshot ||
-        {},
-    },
-
-    transaction: transaction
-      ? {
-          id: String(
-            transaction._id,
-          ),
-
-          type:
-            transaction.type,
-
-          amountMinor:
-            transaction.amountMinor,
-
-          currency:
-            transaction.currency,
-
-          paymentMethod:
-            transaction.paymentMethod,
-
-          failureCategory:
-            transaction.failureCategory,
-
-          failureCode:
-            transaction.failureCode,
-
-          failureReason:
-            transaction.failureReason,
-
-          failureStage:
-            transaction.failureStage,
-
-          occurredAt:
-            transaction.occurredAt,
-        }
-      : null,
-
-    customer: customer
-      ? {
-          id: String(
-            customer._id,
-          ),
-
-          name:
-            customer.fullName ||
-            customer.name ||
-            null,
-
-          email:
-            customer.email ||
-            null,
-
-          phone:
-            customer.phone ||
-            null,
-        }
-      : null,
-  };
-}
-
-function buildPrompt(input) {
-  return `
-You are the AI analysis component of a revenue recovery system.
-
-Analyze ONLY the single recovery case provided below.
-
-Your job is to recommend the most appropriate bounded recovery action.
-
-Allowed actions:
-PAYMENT_RETRY
-DELAYED_RETRY
-RECOVERY_LINK
-ALTERNATIVE_PAYMENT
-REMINDER
-FOLLOW_UP
-ESCALATE
-STOP
-
-Do NOT invent transaction facts.
-Do NOT claim payment was recovered.
-Do NOT execute any action.
-The deterministic policy engine will make the final decision.
-
-Return ONLY valid JSON with this exact shape:
-
-{
-  "action": "PAYMENT_RETRY",
-  "confidence": 0.90,
-  "riskLevel": "LOW",
-  "reason": "short explanation"
-}
-
-confidence must be a number from 0 to 1.
-
-riskLevel must be one of:
-LOW
-MEDIUM
-HIGH
-
-Recovery case data:
-${JSON.stringify(
-  input,
-  null,
-  2,
-)}
-`;
-}
-
-async function callGemini(
-  input,
-) {
-  if (!GEMINI_API_KEY) {
-    throw new Error(
-      'GEMINI_API_KEY is not configured.',
-    );
-  }
-
-  const endpoint =
-    `https://generativelanguage.googleapis.com/v1beta/models/${AI_MODEL}:generateContent?key=${encodeURIComponent(
-      GEMINI_API_KEY,
-    )}`;
-
-  const response =
-    await fetch(endpoint, {
-      method: 'POST',
-
-      headers: {
-        'Content-Type':
-          'application/json',
-      },
-
-      body: JSON.stringify({
-        contents: [
-          {
-            role: 'user',
-
-            parts: [
-              {
-                text:
-                  buildPrompt(
-                    input,
-                  ),
-              },
-            ],
-          },
-        ],
-
-        generationConfig: {
-          temperature: 0.1,
-
-          responseMimeType:
-            'application/json',
-        },
-      }),
-    });
-
-  if (!response.ok) {
-    let details = '';
-
-    try {
-      const body =
-        await response.json();
-
-      details =
-        body?.error?.message ||
-        '';
-    } catch {
-      details = '';
-    }
-
-    const error =
-      new Error(
-        `Gemini API request failed with status ${response.status}.${
-          details
-            ? ` ${details}`
-            : ''
-        }`,
-      );
-
-    error.status =
-      response.status;
-
-    throw error;
-  }
-
-  const data =
-    await response.json();
-
-  const text =
-    data?.candidates?.[0]
-      ?.content?.parts
-      ?.map(
-        (part) =>
-          part?.text || '',
-      )
-      .join('') || '';
-
-  if (!text) {
-    throw new Error(
-      'Gemini returned an empty response.',
-    );
-  }
-
-  return normalizeAIRecommendation(
-    parseAIResponse(text),
-  );
-}
-
-function buildFallbackRecommendation({
-  transaction,
-}) {
-  const failureCategory =
-    transaction
-      ?.failureCategory ||
+  const nextActionAt =
+    raw?.nextActionAt ||
+    raw?.next_action_at ||
     null;
 
-  let action = 'ESCALATE';
+  const reasonCode =
+    String(
+      raw?.reasonCode ||
+        raw?.reason_code ||
+        '',
+    )
+      .trim()
+      .toUpperCase();
 
-  let reason =
-    'No reliable AI recommendation was available, so the system falls back to a bounded safe action.';
+  /*
+   * Gemini may return evaluatedActions.
+   * Keep at most five candidates.
+   */
 
-  let confidence = 0;
+  const rawEvaluatedActions =
+    raw?.evaluatedActions ||
+    raw?.evaluated_actions;
 
-  if (
-    failureCategory ===
-      'NETWORK_ERROR' ||
-    failureCategory ===
-      'PROCESSING_ERROR'
-  ) {
-    action =
-      'PAYMENT_RETRY';
+  const evaluatedActions =
+    Array.isArray(
+      rawEvaluatedActions,
+    )
+      ? rawEvaluatedActions
+          .slice(0, 5)
+          .map((candidate) => {
+            const candidateAction =
+              String(
+                candidate?.action || '',
+              )
+                .trim()
+                .toUpperCase();
 
-    confidence = 0.85;
+            if (
+              !EXECUTABLE_ACTIONS.includes(
+                candidateAction,
+              )
+            ) {
+              return null;
+            }
 
-    reason =
-      'Transient payment failure detected; a bounded retry is the safest fallback.';
-  } else if (
-    failureCategory ===
-    'INSUFFICIENT_FUNDS'
-  ) {
-    action =
-      'DELAYED_RETRY';
+            return {
+              action:
+                candidateAction,
 
-    confidence = 0.5;
+              confidence: clamp(
+                toNumber(
+                  candidate?.confidence,
+                  0,
+                ),
+                0,
+                1,
+              ),
 
-    reason =
-      'Insufficient funds detected; an immediate retry is avoided in favour of a delayed bounded recovery attempt.';
-  } else if (
-    failureCategory ===
-      'AUTHENTICATION_FAILED' ||
-    failureCategory ===
-      'CARD_EXPIRED'
-  ) {
-    action =
-      'ALTERNATIVE_PAYMENT';
-
-    confidence = 0.5;
-
-    reason =
-      'The current payment instrument is unlikely to succeed again, so an alternative payment method is safer.';
-  } else if (
-    failureCategory ===
-      'BANK_DECLINED' ||
-    failureCategory ===
-      'MANDATE_ERROR'
-  ) {
-    action =
-      'ALTERNATIVE_PAYMENT';
-
-    confidence = 0.5;
-
-    reason =
-      'The payment method has a bank or mandate issue, so another supported payment method is preferred.';
-  } else if (
-    failureCategory ===
-      'FRAUD_SUSPECTED' ||
-    failureCategory ===
-      'CARD_BLOCKED'
-  ) {
-    action =
-      'ESCALATE';
-
-    confidence = 0.15;
-
-    reason =
-      'The payment failure may require manual review rather than automated retries.';
-  }
+              reason:
+                String(
+                  candidate?.reason ||
+                    '',
+                ).trim(),
+            };
+          })
+          .filter(Boolean)
+      : [];
 
   return {
     action,
@@ -502,195 +291,569 @@ function buildFallbackRecommendation({
     confidence,
 
     riskLevel:
-      action ===
-      'ESCALATE'
-        ? 'HIGH'
-        : 'MEDIUM',
+      normalizedRisk,
 
     reason,
 
-    provider:
-      'RULE_BASED_FALLBACK',
+    rationale:
+      reason,
+
+    customerMessage,
+
+    nextActionAt,
+
+    stopCondition,
+
+    reasonCode,
+
+    evaluatedActions,
   };
 }
+
+/*
+ * --------------------------------------------------
+ * GEMINI REQUEST
+ * --------------------------------------------------
+ */
+
+async function callGemini(input) {
+  if (!GEMINI_API_KEY) {
+    throw new Error(
+      'GEMINI_API_KEY is not configured.',
+    );
+  }
+
+  const response =
+    await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${AI_MODEL}:generateContent?key=${encodeURIComponent(
+        GEMINI_API_KEY,
+      )}`,
+      {
+        method: 'POST',
+
+        headers: {
+          'Content-Type':
+            'application/json',
+        },
+
+        body: JSON.stringify({
+          contents: [
+            {
+              role: 'user',
+
+              parts: [
+                {
+                  text: input,
+                },
+              ],
+            },
+          ],
+
+          generationConfig: {
+            temperature: 0,
+
+            responseMimeType:
+              'application/json',
+          },
+        }),
+      },
+    );
+
+  if (!response.ok) {
+    const errorText =
+      await response.text();
+
+    const error =
+      new Error(
+        `Gemini request failed with status ${response.status}.`,
+      );
+
+    error.status =
+      response.status;
+
+    error.details =
+      errorText;
+
+    throw error;
+  }
+
+  const payload =
+    await response.json();
+
+  const text =
+    payload?.candidates?.[0]
+      ?.content?.parts?.[0]
+      ?.text;
+
+  if (!text) {
+    throw new Error(
+      'Gemini returned an empty response.',
+    );
+  }
+
+  const parsed =
+    parseAIResponse(text);
+
+  return normalizeAIRecommendation(
+    parsed,
+  );
+}
+
+/*
+ * --------------------------------------------------
+ * BUILD AI INPUT
+ * --------------------------------------------------
+ */
+
+function buildAIInput({
+  recoveryCase,
+  transaction,
+  customer,
+  policyConstraints,
+}) {
+  return `
+You are an AI revenue recovery decision engine.
+
+You MUST return ONLY valid JSON.
+
+Do not invent facts.
+Do not bypass deterministic policy.
+The final action will be validated by a policy engine.
+
+RECOVERY CASE:
+${JSON.stringify(
+  {
+    id:
+      recoveryCase?._id,
+
+    type:
+      recoveryCase?.type,
+
+    status:
+      recoveryCase?.status,
+
+    amountAtRiskMinor:
+      recoveryCase?.amountAtRiskMinor,
+
+    eligibleAmountMinor:
+      recoveryCase?.eligibleAmountMinor,
+
+    recoveredAmountMinor:
+      recoveryCase?.recoveredAmountMinor,
+
+    retryCount:
+      recoveryCase?.retryCount,
+
+    reminderCount:
+      recoveryCase?.reminderCount,
+
+    currentAction:
+      recoveryCase?.currentAction,
+
+    actionTaken:
+      recoveryCase?.actionTaken,
+
+    recoveryWindowEndsAt:
+      recoveryCase?.recoveryWindowEndsAt,
+  },
+  null,
+  2,
+)}
+
+SOURCE TRANSACTION:
+${JSON.stringify(
+  {
+    id:
+      transaction?._id,
+
+    type:
+      transaction?.type,
+
+    amountMinor:
+      transaction?.amountMinor,
+
+    failureCategory:
+      transaction?.failureCategory,
+
+    failureCode:
+      transaction?.failureCode,
+
+    failureReason:
+      transaction?.failureReason,
+
+    failureStage:
+      transaction?.failureStage,
+
+    paymentMethod:
+      transaction?.paymentMethod,
+
+    occurredAt:
+      transaction?.occurredAt,
+  },
+  null,
+  2,
+)}
+
+CUSTOMER:
+${JSON.stringify(
+  {
+    id:
+      customer?._id,
+
+    communicationConsent:
+      customer?.communicationConsent,
+
+    paymentHistory:
+      customer?.paymentHistory,
+  },
+  null,
+  2,
+)}
+
+DETERMINISTIC POLICY CONSTRAINTS:
+${JSON.stringify(
+  policyConstraints,
+  null,
+  2,
+)}
+
+Choose the most appropriate recovery action.
+
+Allowed executable actions:
+${EXECUTABLE_ACTIONS.join(', ')}
+
+JSON format:
+{
+  "action": "ONE_ALLOWED_ACTION",
+  "confidence": 0.0,
+  "riskLevel": "LOW|MEDIUM|HIGH",
+  "reason": "brief reason",
+  "customerMessage": "optional customer-facing message",
+  "nextActionAt": null,
+  "stopCondition": "optional stop condition",
+  "reasonCode": "optional reason code",
+  "evaluatedActions": []
+}
+`;
+}
+
+/*
+ * --------------------------------------------------
+ * CREATE FALLBACK RECOMMENDATION
+ * --------------------------------------------------
+ */
+
+function buildFallbackRecommendation({
+  policyConstraints,
+}) {
+  const policyAction =
+    policyConstraints?.defaultAction ||
+    policyConstraints?.fallbackAction ||
+    policyConstraints?.allowedActions?.[0] ||
+    'ESCALATE';
+
+  return {
+    action:
+      EXECUTABLE_ACTIONS.includes(
+        policyAction,
+      )
+        ? policyAction
+        : 'ESCALATE',
+
+    confidence:
+      0,
+
+    riskLevel:
+      'HIGH',
+
+    reason:
+      'AI analysis failed; deterministic policy fallback was used.',
+
+    rationale:
+      'AI analysis failed; deterministic policy fallback was used.',
+
+    customerMessage:
+      '',
+
+    nextActionAt:
+      null,
+
+    stopCondition:
+      '',
+
+    reasonCode:
+      'AI_FALLBACK',
+
+    evaluatedActions: [],
+  };
+}
+
+/*
+ * --------------------------------------------------
+ * LOAD SOURCE CONTEXT
+ * --------------------------------------------------
+ */
+
+async function loadSourceContext(
+  recoveryCase,
+) {
+  const [
+    transaction,
+    customer,
+  ] = await Promise.all([
+    recoveryCase?.sourceTransactionId
+      ? Transaction.findOne({
+          _id:
+            recoveryCase.sourceTransactionId,
+
+          merchantId:
+            recoveryCase.merchantId,
+        }).lean()
+      : null,
+
+    recoveryCase?.customerId
+      ? Customer.findOne({
+          _id:
+            recoveryCase.customerId,
+
+          merchantId:
+            recoveryCase.merchantId,
+        }).lean()
+      : null,
+  ]);
+
+  return {
+    transaction,
+    customer,
+  };
+}
+
+/*
+ * --------------------------------------------------
+ * VALIDATE AGAINST POLICY
+ * --------------------------------------------------
+ */
 
 async function validateAgainstPolicy({
   recoveryCase,
   transaction,
+  customer,
   aiRecommendation,
+  now,
 }) {
-  const policyDecision =
-    decideRecoveryAction({
-      failureCategory:
-        transaction
-          ?.failureCategory,
-
-      caseType:
-        recoveryCase.type,
-
-      status:
-        recoveryCase.status,
-
-      retryAttemptCount:
-        recoveryCase
-          .retryAttemptCount ||
-        0,
-
-      reminderCount:
-        recoveryCase
-          .reminderCount ||
-        0,
-
-      eligibleAmountMinor:
-        recoveryCase
-          .eligibleAmountMinor ||
-        0,
-
-      recoveredAmountMinor:
-        recoveryCase
-          .recoveredAmountMinor ||
-        0,
-
-      recoveryWindowEndsAt:
-        recoveryCase.recoveryWindowEndsAt,
-
-      policySnapshot:
-        recoveryCase.policySnapshot ||
-        {},
-
-      currentAction:
-        recoveryCase.currentAction ||
-        null,
+  const policyConstraints =
+    await getRecoveryPolicyConstraints({
+      recoveryCase,
+      transaction,
+      customer,
+      now,
     });
 
-  const accepted =
-    aiRecommendation.action ===
-    policyDecision.action;
+  const policyValidation =
+    validateAIRecommendation({
+      aiRecommendation,
+      recoveryCase,
+      transaction,
+      customer,
+      now,
+    });
 
   return {
-    accepted,
+    ...policyValidation,
 
-    reasonCode: accepted
-      ? 'AI_RECOMMENDATION_ACCEPTED'
-      : 'AI_RECOMMENDATION_REJECTED',
-
-    message: accepted
-      ? 'AI recommendation was accepted by the deterministic recovery policy.'
-      : 'AI recommendation was rejected because the deterministic recovery policy selected a different action.',
-
-    aiRecommendation,
-
-    policyDecision,
-
-    finalAction:
-      policyDecision.action,
+    policyConstraints,
   };
 }
+
+/*
+ * --------------------------------------------------
+ * AI AUDIT
+ * --------------------------------------------------
+ */
 
 async function createAIAnalysisAudit({
   recoveryCase,
   aiRecommendation,
   policyValidation,
 }) {
-  try {
-    await AuditLog.create({
-      merchantId:
-        recoveryCase.merchantId,
+  await AuditLog.create({
+    merchantId:
+      recoveryCase.merchantId,
 
-      recoveryCaseId:
-        recoveryCase._id,
+    recoveryCaseId:
+      recoveryCase._id,
 
-      transactionId:
-        recoveryCase.sourceTransactionId,
+    actorType:
+      'AI_AGENT',
 
-      actorType:
-        'AI_AGENT',
+    eventType:
+      'AI_ANALYSIS_COMPLETED',
 
-      eventType:
-        'AI_ANALYSIS_COMPLETED',
+    action:
+      aiRecommendation.action,
 
-      action:
-        aiRecommendation.action,
+    result:
+      policyValidation.accepted
+        ? 'SUCCEEDED'
+        : 'REJECTED',
 
-      result:
-        policyValidation.accepted
-          ? 'ACCEPTED'
-          : 'REJECTED',
+    message:
+      policyValidation.reason ||
+      aiRecommendation.reason ||
+      'AI analysis completed.',
 
-      message:
-        aiRecommendation.reason,
+    metadata:
+      createAuditMetadata({
+        aiModel:
+          AI_MODEL,
 
-      metadata:
-        createAuditMetadata({
-          provider:
-            aiRecommendation.provider,
+        recommendedAction:
+          aiRecommendation.action,
 
-          confidence:
-            aiRecommendation.confidence,
+        confidence:
+          aiRecommendation.confidence,
 
-          riskLevel:
-            aiRecommendation.riskLevel,
+        riskLevel:
+          aiRecommendation.riskLevel,
 
-          policyAction:
-            policyValidation
-              .policyDecision
-              .action,
+        reasonCode:
+          aiRecommendation.reasonCode,
 
-          finalAction:
-            policyValidation
-              .finalAction,
-        }),
-    });
-  } catch (auditError) {
-    /*
-     * Analysis should still succeed even if
-     * an audit write fails.
-     */
-    console.error(
-      'AI analysis audit log error:',
-      auditError,
-    );
-  }
+        policyAccepted:
+          policyValidation.accepted,
+
+        finalAction:
+          policyValidation.finalAction,
+
+        executionAllowed:
+          policyValidation.executionAllowed,
+
+        policyReasonCode:
+          policyValidation.reasonCode,
+
+        evaluatedActions:
+          aiRecommendation.evaluatedActions,
+      }),
+
+    occurredAt:
+      new Date(),
+  });
 }
+
+/*
+ * --------------------------------------------------
+ * PERSIST AI DECISION
+ * --------------------------------------------------
+ */
+
+async function persistAIAnalysis({
+  recoveryCase,
+  aiRecommendation,
+  policyValidation,
+}) {
+  recoveryCase.agentDecision = {
+    ...(recoveryCase.agentDecision || {}),
+
+    action:
+      aiRecommendation.action,
+
+    recommendedAction:
+      aiRecommendation.action,
+
+    finalAction:
+      policyValidation.finalAction,
+
+    policyAccepted:
+      policyValidation.accepted,
+
+    risk:
+      aiRecommendation.riskLevel,
+
+    provider:
+      'GEMINI',
+
+    policyReasonCode:
+      policyValidation.reasonCode,
+
+    confidence:
+      aiRecommendation.confidence,
+
+    reasonCode:
+      aiRecommendation.reasonCode,
+
+    rationale:
+      aiRecommendation.reason,
+
+    customerMessage:
+      aiRecommendation.customerMessage,
+
+    nextActionAt:
+      aiRecommendation.nextActionAt,
+
+    stopCondition:
+      aiRecommendation.stopCondition,
+
+    analyzedAt:
+      new Date(),
+  };
+
+  /*
+   * Persist current approved action only when execution
+   * is actually allowed.
+   */
+
+  if (
+    policyValidation.executionAllowed &&
+    policyValidation.finalAction
+  ) {
+    recoveryCase.currentAction =
+      policyValidation.finalAction;
+  }
+
+  await recoveryCase.save();
+}
+
+/*
+ * --------------------------------------------------
+ * SINGLE CASE ANALYSIS
+ * --------------------------------------------------
+ */
 
 async function analyzeSingleRecoveryCase({
   recoveryCase,
 }) {
-  const [
+  const now =
+    new Date();
+
+  const {
     transaction,
     customer,
-  ] = await Promise.all([
-    Transaction.findOne({
-      _id:
-        recoveryCase.sourceTransactionId,
+  } =
+    await loadSourceContext(
+      recoveryCase,
+    );
 
-      merchantId:
-        recoveryCase.merchantId,
-    })
-      .select(
-        '_id type status amountMinor currency paymentMethod failureCategory failureCode failureReason failureStage occurredAt',
-      )
-      .lean(),
-
-    Customer.findOne({
-      _id:
-        recoveryCase.customerId,
-
-      merchantId:
-        recoveryCase.merchantId,
-    })
-      .select(
-        '_id fullName name email phone',
-      )
-      .lean(),
-  ]);
+  const policyConstraints =
+    await getRecoveryPolicyConstraints({
+      recoveryCase,
+      transaction,
+      customer,
+      now,
+    });
 
   const input =
     buildAIInput({
       recoveryCase,
       transaction,
       customer,
+      policyConstraints,
     });
+
+  /*
+   * --------------------------------------------------
+   * CALL GEMINI
+   * --------------------------------------------------
+   */
 
   let aiRecommendation;
 
@@ -705,22 +868,54 @@ async function analyzeSingleRecoveryCase({
 
     aiRecommendation =
       buildFallbackRecommendation({
-        transaction,
+        policyConstraints,
       });
   }
+
+  /*
+   * --------------------------------------------------
+   * POLICY VALIDATION
+   * --------------------------------------------------
+   */
 
   const policyValidation =
     await validateAgainstPolicy({
       recoveryCase,
       transaction,
+      customer,
       aiRecommendation,
+      now,
     });
+
+  /*
+   * --------------------------------------------------
+   * AUDIT
+   * --------------------------------------------------
+   */
 
   await createAIAnalysisAudit({
     recoveryCase,
     aiRecommendation,
     policyValidation,
   });
+
+  /*
+   * --------------------------------------------------
+   * PERSIST APPROVED DECISION
+   * --------------------------------------------------
+   */
+
+  await persistAIAnalysis({
+    recoveryCase,
+    aiRecommendation,
+    policyValidation,
+  });
+
+  /*
+   * --------------------------------------------------
+   * RETURN COMPLETE RESULT
+   * --------------------------------------------------
+   */
 
   return {
     recoveryCaseId:
@@ -732,8 +927,22 @@ async function analyzeSingleRecoveryCase({
 
     finalAction:
       policyValidation.finalAction,
+
+    blocked:
+      policyValidation.executionAllowed
+        ? false
+        : !policyValidation.finalAction,
+
+    skippedAI:
+      false,
   };
 }
+
+/*
+ * --------------------------------------------------
+ * ACTIVE CASE QUERY
+ * --------------------------------------------------
+ */
 
 function buildActiveCaseQuery(
   merchantId,
@@ -752,21 +961,137 @@ function buildActiveCaseQuery(
   };
 }
 
-/**
- * Supports BOTH:
+/*
+ * --------------------------------------------------
+ * DATE RANGE
+ * --------------------------------------------------
+ */
+
+function parseISTDateRange(
+  from,
+  to,
+) {
+  const isValid = (
+    value,
+  ) =>
+    typeof value === 'string' &&
+    /^\d{4}-\d{2}-\d{2}$/.test(
+      value,
+    );
+
+  if (
+    !from &&
+    !to
+  ) {
+    return {
+      fromDate: null,
+      toDateExclusive: null,
+    };
+  }
+
+  if (
+    !isValid(from) ||
+    !isValid(to)
+  ) {
+    const error =
+      new Error(
+        'from and to must use YYYY-MM-DD format.',
+      );
+
+    error.status =
+      400;
+
+    throw error;
+  }
+
+  const fromDate =
+    new Date(
+      `${from}T00:00:00+05:30`,
+    );
+
+  const toDate =
+    new Date(
+      `${to}T00:00:00+05:30`,
+    );
+
+  if (
+    Number.isNaN(
+      fromDate.getTime(),
+    ) ||
+    Number.isNaN(
+      toDate.getTime(),
+    )
+  ) {
+    const error =
+      new Error(
+        'Invalid AI analysis date range.',
+      );
+
+    error.status =
+      400;
+
+    throw error;
+  }
+
+  const toDateExclusive =
+    new Date(
+      toDate.getTime() +
+        24 * 60 * 60 * 1000,
+    );
+
+  if (
+    fromDate >=
+    toDateExclusive
+  ) {
+    const error =
+      new Error(
+        'Invalid AI analysis date range.',
+      );
+
+    error.status =
+      400;
+
+    throw error;
+  }
+
+  return {
+    fromDate,
+    toDateExclusive,
+  };
+}
+
+/*
+ * --------------------------------------------------
+ * RUN AI RECOVERY ANALYSIS
+ * --------------------------------------------------
  *
- * 1. Selected-case analysis
+ * Supports:
+ *
+ * 1. Single case:
  *    { recoveryCaseId }
  *
- * 2. Existing batch analysis
- *    { limit, batchSize, activeOnly }
+ * 2. Batch:
+ *    {
+ *      limit,
+ *      batchSize,
+ *      activeOnly,
+ *      from,
+ *      to,
+ *      status
+ *    }
+ *
+ * --------------------------------------------------
  */
+
 async function runAIRecoveryAnalysis({
   merchantId,
   recoveryCaseId,
   limit = 20,
   batchSize = 5,
   activeOnly = false,
+  from,
+  to,
+  status,
 }) {
   if (!merchantId) {
     throw new Error(
@@ -783,7 +1108,9 @@ async function runAIRecoveryAnalysis({
   if (recoveryCaseId) {
     const recoveryCase =
       await RecoveryCase.findOne({
-        _id: recoveryCaseId,
+        _id:
+          recoveryCaseId,
+
         merchantId,
       }).lean();
 
@@ -793,7 +1120,8 @@ async function runAIRecoveryAnalysis({
           'Recovery case not found.',
         );
 
-      error.status = 404;
+      error.status =
+        404;
 
       throw error;
     }
@@ -804,13 +1132,20 @@ async function runAIRecoveryAnalysis({
       });
 
     return {
-      mode: 'SINGLE_CASE',
+      mode:
+        'SINGLE_CASE',
 
-      totalCases: 1,
+      totalCases:
+        1,
 
-      batchSize: 1,
+      batchSize:
+        1,
 
-      totalBatches: 1,
+      totalBatches:
+        1,
+
+      geminiRequests:
+        1,
 
       recommendations: [
         recommendation,
@@ -824,21 +1159,73 @@ async function runAIRecoveryAnalysis({
    * --------------------------------------------------
    */
 
-  const query = activeOnly
-    ? buildActiveCaseQuery(
-        merchantId,
-      )
-    : {
-        merchantId,
-      };
+  const query = {
+    ...(activeOnly
+      ? buildActiveCaseQuery(
+          merchantId,
+        )
+      : {
+          merchantId,
+        }),
+  };
 
-  const safeLimit = Math.min(
-    Math.max(
-      Number(limit) || 20,
-      1,
-    ),
-    100,
-  );
+  /*
+   * --------------------------------------------------
+   * STATUS FILTER
+   * --------------------------------------------------
+   */
+
+  if (
+    status &&
+    status !== 'ALL' &&
+    status !== 'ACTION_REQUIRED'
+  ) {
+    query.status =
+      status;
+  }
+
+  /*
+   * --------------------------------------------------
+   * IST DATE FILTER
+   * --------------------------------------------------
+   */
+
+  const {
+    fromDate,
+    toDateExclusive,
+  } =
+    parseISTDateRange(
+      from,
+      to,
+    );
+
+  if (
+    fromDate &&
+    toDateExclusive
+  ) {
+    query.createdAt = {
+      $gte:
+        fromDate,
+
+      $lt:
+        toDateExclusive,
+    };
+  }
+
+  /*
+   * --------------------------------------------------
+   * LIMITS
+   * --------------------------------------------------
+   */
+
+  const safeLimit =
+    Math.min(
+      Math.max(
+        Number(limit) || 20,
+        1,
+      ),
+      100,
+    );
 
   const safeBatchSize =
     Math.min(
@@ -849,65 +1236,127 @@ async function runAIRecoveryAnalysis({
       safeLimit,
     );
 
+  /*
+   * --------------------------------------------------
+   * LOAD CASES
+   * --------------------------------------------------
+   */
+
   const recoveryCases =
-    await RecoveryCase.find(query)
+    await RecoveryCase.find(
+      query,
+    )
       .sort({
-        createdAt: -1,
+        createdAt:
+          -1,
       })
-      .limit(safeLimit)
+      .limit(
+        safeLimit,
+      )
       .lean();
 
-  const recommendations = [];
+  /*
+   * --------------------------------------------------
+   * TRUE AI BATCH PROCESSING
+   * --------------------------------------------------
+   *
+   * IMPORTANT:
+   * batchSize = 20 means:
+   *
+   * 20 cases -> 1 Gemini request
+   *
+   * not:
+   *
+   * 20 cases -> 20 Gemini requests
+   *
+   * --------------------------------------------------
+   */
 
-  for (
-    let index = 0;
-    index <
-    recoveryCases.length;
-    index += safeBatchSize
+  if (
+    recoveryCases.length === 0
   ) {
-    const batch =
-      recoveryCases.slice(
-        index,
-        index + safeBatchSize,
-      );
+    return {
+      mode:
+        'BATCH',
 
-    /*
-     * Process cases sequentially inside
-     * this demo implementation so rate-limit
-     * errors are easier to control.
-     */
-    for (const recoveryCase of batch) {
-      const recommendation =
-        await analyzeSingleRecoveryCase({
-          recoveryCase,
-        });
+      totalCases:
+        0,
 
-      recommendations.push(
-        recommendation,
-      );
-    }
+      batchSize:
+        safeBatchSize,
+
+      totalBatches:
+        0,
+
+      geminiRequests:
+        0,
+
+      failedBatches:
+        0,
+
+      fallbackRecommendations:
+        0,
+
+      batchResults:
+        [],
+
+      recommendations:
+        [],
+    };
   }
 
+  console.log(
+    `Starting TRUE AI batch analysis: ${recoveryCases.length} cases, batchSize=${safeBatchSize}`,
+  );
+
+  const batchResult =
+    await processRecoveryCasesInBatches(
+      recoveryCases,
+      {
+        batchSize:
+          safeBatchSize,
+      },
+    );
+
+  console.log(
+    `TRUE AI batch analysis completed: ${batchResult.totalCases} cases, ${batchResult.geminiRequests} Gemini requests`,
+  );
+
   return {
-    mode: 'BATCH',
+    mode:
+      'BATCH',
 
     totalCases:
-      recoveryCases.length,
+      batchResult.totalCases,
 
     batchSize:
-      safeBatchSize,
+      batchResult.batchSize,
 
     totalBatches:
-      recoveryCases.length
-        ? Math.ceil(
-            recoveryCases.length /
-              safeBatchSize,
-          )
-        : 0,
+      batchResult.totalBatches,
 
-    recommendations,
+    geminiRequests:
+      batchResult.geminiRequests,
+
+    failedBatches:
+      batchResult.failedBatches,
+
+    fallbackRecommendations:
+      batchResult.fallbackRecommendations,
+
+    batchResults:
+      batchResult.batchResults,
+
+    recommendations:
+      batchResult.recommendations,
   };
 }
+
+/*
+ * --------------------------------------------------
+ * EXPORT
+ * --------------------------------------------------
+ */
 
 module.exports = {
   runAIRecoveryAnalysis,

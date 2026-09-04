@@ -24,14 +24,20 @@ function buildBatchPrompt(recoveryCases) {
   return `
 You are an AI revenue recovery analysis system.
 
-Analyze the supplied recovery cases.
+Analyze ALL supplied recovery cases independently, but in ONE batch.
 
-Your job is ONLY to recommend a bounded recovery action.
+Your job is ONLY to recommend a bounded recovery action for EACH case.
 Do not execute payments.
-Do not invent actions.
 Do not modify database records.
+Do not claim that a payment succeeded unless the supplied evidence explicitly says so.
 
-Allowed actions:
+IMPORTANT POLICY RULE:
+Every recovery case contains its own policy.allowedActions.
+That list is the authoritative action boundary for THAT case.
+You MUST choose recommendedAction from that case's policy.allowedActions.
+Never choose an action merely because it exists in the global vocabulary.
+
+Globally known action vocabulary:
 
 PAYMENT_RETRY
 DELAYED_RETRY
@@ -42,7 +48,7 @@ FOLLOW_UP
 ESCALATE
 STOP
 
-For every recovery case, return exactly one recommendation.
+For every supplied, AI-eligible recovery case, return exactly one recommendation.
 
 Return ONLY valid JSON in this structure:
 
@@ -50,7 +56,7 @@ Return ONLY valid JSON in this structure:
   "recommendations": [
     {
       "recoveryCaseId": "string",
-      "recommendedAction": "one allowed action",
+      "recommendedAction": "one action from this case's policy.allowedActions",
       "confidence": 0.0,
       "riskLevel": "LOW | MEDIUM | HIGH",
       "reason": "short explanation"
@@ -59,14 +65,17 @@ Return ONLY valid JSON in this structure:
 }
 
 Rules:
-
-- recoveryCaseId must exactly match the supplied case.
-- recommendedAction must be one of the allowed actions.
+- recoveryCaseId must exactly match a supplied recovery case.
+- recommendedAction MUST be in that case's policy.allowedActions.
+- If a case has an empty policy.allowedActions, that case should not be present in this prompt.
 - confidence must be between 0 and 1.
 - riskLevel must be LOW, MEDIUM, or HIGH.
+- Return exactly one recommendation for each supplied case.
 - Do not create recommendations for cases that were not supplied.
-- Do not omit supplied cases.
-- Keep reasons concise.
+- Do not omit any supplied case.
+- Keep reasons concise and evidence-based.
+- Consider failure details, amount at risk, retry count, reminder count, recovery-window timing, payment history, communication consent, and the case-specific policy boundary.
+- Prefer the least aggressive action that is well supported by the supplied evidence.
 - Never claim that money was recovered merely because an action is recommended.
 
 Recovery cases:
@@ -181,7 +190,9 @@ function validateBatchResponse(
     new Set(
       recoveryCases.map(
         (recoveryCase) =>
-          String(recoveryCase.recoveryCaseId),
+          String(
+            recoveryCase.recoveryCaseId,
+          ),
       ),
     );
 
@@ -219,6 +230,35 @@ function validateBatchResponse(
           validated.recoveryCaseId,
         );
 
+        const sourceCase =
+          recoveryCases.find(
+            (recoveryCase) =>
+              String(
+                recoveryCase.recoveryCaseId,
+              ) ===
+              validated.recoveryCaseId,
+          );
+
+        if (!sourceCase) {
+          throw new Error(
+            `AI source case ${validated.recoveryCaseId} was not found.`,
+          );
+        }
+
+        const allowedActions =
+          sourceCase.policy
+            ?.allowedActions || [];
+
+        if (
+          !allowedActions.includes(
+            validated.recommendedAction,
+          )
+        ) {
+          throw new Error(
+            `AI action ${validated.recommendedAction} is not allowed for recovery case ${validated.recoveryCaseId}.`,
+          );
+        }
+
         return validated;
       },
     );
@@ -253,20 +293,16 @@ async function analyzeRecoveryBatch(
   const client =
     createGeminiClient();
 
-  const prompt =
-    buildBatchPrompt(
-      recoveryCases,
-    );
+  const prompt = buildBatchPrompt(
+    recoveryCases,
+  );
 
   const response =
     await client.models.generateContent({
       model: getGeminiModel(),
-
       contents: prompt,
-
       config: {
         temperature: 0,
-
         responseMimeType:
           'application/json',
       },
@@ -289,7 +325,7 @@ async function analyzeRecoveryBatch(
   try {
     parsedResponse =
       JSON.parse(responseText);
-  } catch (error) {
+  } catch {
     throw new Error(
       'Gemini returned invalid JSON.',
     );
@@ -303,7 +339,6 @@ async function analyzeRecoveryBatch(
 
   return {
     model: getGeminiModel(),
-
     recommendations,
   };
 }

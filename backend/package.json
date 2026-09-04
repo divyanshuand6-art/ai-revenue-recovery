@@ -10,7 +10,8 @@
     "check": "node --check src/app.js && node --check src/server.js && node --check src/config/db.js && node --check src/config/dns.js && node --check src/models/User.js && node --check src/models/Customer.js && node --check src/models/Transaction.js && node --check src/models/Subscription.js && node --check src/models/RecoveryCase.js && node --check src/models/AuditLog.js && node --check src/seed/seedDemoData.js && node --check tests/models.test.js",
     "test": "npm run check && node tests/models.test.js && node src/seed/seedDemoData.js --dry-run",
     "seed:demo": "node src/seed/seedDemoData.js",
-    "seed:test": "node src/seed/seedRecoveryTestData.js"
+    "seed:test": "node src/seed/seedRecoveryTestData.js",
+    "seed:recovery-test": "node src/seed/seedRecoveryTestData.js"
   },
   "dependencies": {
     "@google/genai": "^2.18.0",
@@ -19,7 +20,8 @@
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "jsonwebtoken": "^9.0.3",
-    "mongoose": "^8.9.3"
+    "mongoose": "^8.9.3",
+    "razorpay": "^2.9.8"
   },
   "devDependencies": {
     "nodemon": "^3.1.9"

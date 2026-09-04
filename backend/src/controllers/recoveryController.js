@@ -3,8 +3,8 @@ const Transaction = require('../models/Transaction');
 const AuditLog = require('../models/AuditLog');
 
 const {
-  decideRecoveryAction,
-} = require('../services/recoveryDecisionService');
+  simulateSuccessfulRecoveryPayment,
+} = require('../services/recoveryPaymentService');
 
 const {
   executeRecoveryAction,
@@ -18,6 +18,14 @@ const {
   runAIRecoveryAnalysis,
 } = require('../services/aiRecoveryAnalysisRunner');
 
+const {
+  validateAIRecommendation,
+} = require('../services/aiRecommendationValidationService');
+
+
+const {
+  executeRecoveryCasesInBulk,
+} = require('../services/bulkRecoveryExecutionService');
 /**
  * GET /api/recovery/cases
  */
@@ -147,11 +155,26 @@ async function getRecoveryCaseTimeline(
 
     const recoveryCase =
       await RecoveryCase.findOne({
-        _id: recoveryCaseId,
+        _id:
+          recoveryCaseId,
         merchantId,
       })
         .select(
-          '_id customerId sourceTransactionId subscriptionId',
+          [
+            '_id',
+            'customerId',
+            'sourceTransactionId',
+            'subscriptionId',
+            'status',
+            'currentAction',
+            'actionTaken',
+            'amountAtRiskMinor',
+            'eligibleAmountMinor',
+            'recoveredAmountMinor',
+            'recoveryTransactionId',
+            'currency',
+            'recoveredAt',
+          ].join(' '),
         )
         .lean();
 
@@ -212,6 +235,43 @@ async function getRecoveryCaseTimeline(
         recoveryCaseId:
           recoveryCase._id,
 
+        case: {
+          _id:
+            recoveryCase._id,
+
+          status:
+            recoveryCase.status,
+
+          currentAction:
+            recoveryCase.currentAction ||
+            null,
+
+          actionTaken:
+            recoveryCase.actionTaken ||
+            null,
+
+          amountAtRiskMinor:
+            recoveryCase.amountAtRiskMinor,
+
+          eligibleAmountMinor:
+            recoveryCase.eligibleAmountMinor,
+
+          recoveredAmountMinor:
+            recoveryCase.recoveredAmountMinor,
+
+          recoveryTransactionId:
+            recoveryCase.recoveryTransactionId ||
+            null,
+
+          currency:
+            recoveryCase.currency ||
+            'INR',
+
+          recoveredAt:
+            recoveryCase.recoveredAt ||
+            null,
+        },
+
         customer:
           customer || null,
 
@@ -263,7 +323,10 @@ async function getRecoveryCaseTimeline(
  * {
  *   limit: 20,
  *   batchSize: 5,
- *   activeOnly: true
+ *   activeOnly: true,
+ *   from: "2026-08-01",
+ *   to: "2026-08-31",
+ *   status: "ALL"
  * }
  */
 async function runAIRecoveryAnalysisController(
@@ -284,9 +347,18 @@ async function runAIRecoveryAnalysisController(
 
     const {
       recoveryCaseId,
+
       limit = 20,
+
       batchSize = 5,
+
       activeOnly = false,
+
+      from,
+
+      to,
+
+      status = 'ALL',
     } = req.body || {};
 
     /*
@@ -302,16 +374,18 @@ async function runAIRecoveryAnalysisController(
 
           recoveryCaseId,
 
-          limit: 1,
+          limit:
+            1,
 
-          batchSize: 1,
+          batchSize:
+            1,
 
-          activeOnly: true,
+          activeOnly:
+            true,
         });
 
       return res.status(200).json({
         success: true,
-
         data: result,
       });
     }
@@ -354,6 +428,54 @@ async function runAIRecoveryAnalysisController(
       });
     }
 
+    /*
+     * --------------------------------------------------
+     * DATE VALIDATION
+     * --------------------------------------------------
+     */
+
+    if (
+      from !== undefined &&
+      from !== null &&
+      from !== '' &&
+      !/^\d{4}-\d{2}-\d{2}$/.test(
+        String(from),
+      )
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'from must use YYYY-MM-DD format.',
+      });
+    }
+
+    if (
+      to !== undefined &&
+      to !== null &&
+      to !== '' &&
+      !/^\d{4}-\d{2}-\d{2}$/.test(
+        String(to),
+      )
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'to must use YYYY-MM-DD format.',
+      });
+    }
+
+    if (
+      from &&
+      to &&
+      from > to
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'from cannot be later than to.',
+      });
+    }
+
     const result =
       await runAIRecoveryAnalysis({
         merchantId,
@@ -366,11 +488,19 @@ async function runAIRecoveryAnalysisController(
 
         activeOnly:
           activeOnly === true,
+
+        from:
+          from || undefined,
+
+        to:
+          to || undefined,
+
+        status:
+          status || 'ALL',
       });
 
     return res.status(200).json({
       success: true,
-
       data: result,
     });
   } catch (error) {
@@ -379,11 +509,25 @@ async function runAIRecoveryAnalysisController(
       error,
     );
 
-    if (error.name === 'CastError') {
+    if (
+      error.name ===
+      'CastError'
+    ) {
       return res.status(400).json({
         success: false,
         message:
           'Invalid recoveryCaseId.',
+      });
+    }
+
+    if (
+      error.status === 400
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          error.message ||
+          'Invalid AI analysis request.',
       });
     }
 
@@ -400,6 +544,7 @@ async function runAIRecoveryAnalysisController(
     /*
      * Preserve Gemini rate-limit status.
      */
+
     if (
       error.status === 429
     ) {
@@ -423,6 +568,28 @@ async function runAIRecoveryAnalysisController(
 /**
  * POST /api/recovery/execute
  */
+
+/*
+ * --------------------------------------------------
+ * POST /api/recovery/execute
+ * --------------------------------------------------
+ *
+ * IMPORTANT:
+ *
+ * Execution must consume the AI decision that was
+ * already analyzed + persisted on the recovery case.
+ *
+ * Flow:
+ *
+ * saved agentDecision.finalAction
+ *          ↓
+ * current-state policy revalidation
+ *          ↓
+ * execute only the validated final action
+ *
+ * This function MUST NOT independently choose a new
+ * action using decideRecoveryAction().
+ */
 async function decideAndExecuteRecovery(
   req,
   res,
@@ -430,7 +597,13 @@ async function decideAndExecuteRecovery(
   try {
     const {
       recoveryCaseId,
-    } = req.body;
+    } = req.body || {};
+
+    /*
+     * --------------------------------------------------
+     * 1. BASIC REQUEST VALIDATION
+     * --------------------------------------------------
+     */
 
     if (!recoveryCaseId) {
       return res.status(400).json({
@@ -451,11 +624,18 @@ async function decideAndExecuteRecovery(
       });
     }
 
+    /*
+     * --------------------------------------------------
+     * 2. LOAD OWNED RECOVERY CASE
+     * --------------------------------------------------
+     */
+
     const recoveryCase =
       await RecoveryCase.findOne({
-        _id: recoveryCaseId,
+        _id:
+          recoveryCaseId,
         merchantId,
-      }).lean();
+      });
 
     if (!recoveryCase) {
       return res.status(404).json({
@@ -465,6 +645,151 @@ async function decideAndExecuteRecovery(
       });
     }
 
+    /*
+     * --------------------------------------------------
+     * 3. ACTION_EXECUTED = WAITING FOR PAYMENT
+     * --------------------------------------------------
+     *
+     * Do NOT run policy again and accidentally turn
+     * this condition into a STOP action.
+     */
+
+    if (
+      recoveryCase.status ===
+      'ACTION_EXECUTED'
+    ) {
+      return res.status(409).json({
+        success: false,
+
+        message:
+          'Recovery action has already been executed and is awaiting payment confirmation.',
+
+        data: {
+          recoveryCaseId:
+            recoveryCase._id,
+
+          currentStatus:
+            recoveryCase.status,
+
+          currentAction:
+            recoveryCase.currentAction ||
+            null,
+
+          recoveryConfirmed:
+            false,
+
+          awaitingPaymentConfirmation:
+            true,
+        },
+      });
+    }
+
+    /*
+     * --------------------------------------------------
+     * 4. TERMINAL CASE PROTECTION
+     * --------------------------------------------------
+     */
+
+    const terminalStatuses =
+      new Set([
+        'RECOVERED',
+        'FAILED',
+        'ESCALATED',
+        'EXPIRED',
+        'STOPPED',
+      ]);
+
+    if (
+      terminalStatuses.has(
+        recoveryCase.status,
+      )
+    ) {
+      return res.status(409).json({
+        success: false,
+
+        message:
+          `Recovery case is already in terminal status: ${recoveryCase.status}.`,
+
+        data: {
+          recoveryCaseId:
+            recoveryCase._id,
+
+          currentStatus:
+            recoveryCase.status,
+
+          recoveryConfirmed:
+            recoveryCase.status ===
+            'RECOVERED',
+        },
+      });
+    }
+
+    /*
+     * --------------------------------------------------
+     * 5. AI DECISION MUST EXIST
+     * --------------------------------------------------
+     *
+     * AI analysis must happen before execution.
+     */
+
+    if (
+      !recoveryCase.agentDecision
+    ) {
+      return res.status(400).json({
+        success: false,
+
+        message:
+          'No AI decision is available for this recovery case. Run AI analysis before execution.',
+      });
+    }
+
+    /*
+     * --------------------------------------------------
+     * 6. FINAL AI ACTION MUST EXIST
+     * --------------------------------------------------
+     *
+     * A blocked analysis intentionally has no
+     * executable finalAction.
+     */
+
+    const storedFinalAction =
+      recoveryCase
+        .agentDecision
+        .finalAction ||
+      recoveryCase
+        .agentDecision
+        .action ||
+      null;
+
+    if (!storedFinalAction) {
+      return res.status(409).json({
+        success: false,
+
+        message:
+          recoveryCase
+            .agentDecision
+            .rationale ||
+          'No executable AI/policy final action is available for this recovery case.',
+
+        data: {
+          recoveryCaseId:
+            recoveryCase._id,
+
+          aiDecision:
+            recoveryCase.agentDecision,
+
+          executionAllowed:
+            false,
+        },
+      });
+    }
+
+    /*
+     * --------------------------------------------------
+     * 7. LOAD SOURCE TRANSACTION
+     * --------------------------------------------------
+     */
+
     const sourceTransaction =
       await Transaction.findOne({
         _id:
@@ -473,56 +798,199 @@ async function decideAndExecuteRecovery(
         merchantId,
       })
         .select(
-          '_id failureCategory paymentMethod type amountMinor occurredAt',
+          [
+            '_id',
+            'type',
+            'status',
+            'amountMinor',
+            'currency',
+            'paymentMethod',
+            'failureCategory',
+            'failureCode',
+            'failureReason',
+            'failureStage',
+            'occurredAt',
+          ].join(' '),
         )
         .lean();
 
     if (!sourceTransaction) {
       return res.status(404).json({
         success: false,
+
         message:
           'Source transaction for this recovery case was not found.',
       });
     }
 
-    const decision =
-      decideRecoveryAction({
-        failureCategory:
-          sourceTransaction.failureCategory,
+    /*
+     * --------------------------------------------------
+     * 8. LOAD CUSTOMER CONTEXT
+     * --------------------------------------------------
+     *
+     * Current policy may depend on communication
+     * consent.
+     */
 
-        caseType:
-          recoveryCase.type,
+    const customer =
+      await require('../models/Customer')
+        .findOne({
+          _id:
+            recoveryCase.customerId,
 
-        status:
-          recoveryCase.status,
+          merchantId,
+        })
+        .select(
+          [
+            '_id',
+            'communicationConsent',
+            'paymentHistory',
+          ].join(' '),
+        )
+        .lean();
 
-        retryAttemptCount:
-          recoveryCase.retryAttemptCount ||
+    /*
+     * --------------------------------------------------
+     * 9. REVALIDATE THE STORED AI DECISION
+     * --------------------------------------------------
+     *
+     * This is critical.
+     *
+     * We trust neither the old case state nor the old
+     * policy result blindly.
+     *
+     * We re-check the SAME stored AI recommendation
+     * against the CURRENT case state and policy.
+     */
+
+    const aiRecommendation = {
+      recoveryCaseId:
+        String(
+          recoveryCase._id,
+        ),
+
+      recommendedAction:
+        storedFinalAction,
+
+      confidence:
+        Number(
+          recoveryCase
+            .agentDecision
+            .confidence ??
           0,
+        ),
 
-        reminderCount:
-          recoveryCase.reminderCount ||
-          0,
+      riskLevel:
+        recoveryCase
+          .agentDecision
+          .riskLevel ||
+        'MEDIUM',
 
-        eligibleAmountMinor:
-          recoveryCase.eligibleAmountMinor ||
-          0,
+      reason:
+        recoveryCase
+          .agentDecision
+          .rationale ||
+        'Persisted AI recovery decision.',
+    };
 
-        recoveredAmountMinor:
-          recoveryCase.recoveredAmountMinor ||
-          0,
+    const policyValidation =
+      validateAIRecommendation({
+        aiRecommendation,
 
-        recoveryWindowEndsAt:
-          recoveryCase.recoveryWindowEndsAt,
+        recoveryCase,
 
-        policySnapshot:
-          recoveryCase.policySnapshot ||
-          {},
+        transaction:
+          sourceTransaction,
 
-        currentAction:
-          recoveryCase.currentAction ||
-          null,
+        customer,
+
+        now:
+          new Date(),
       });
+
+    /*
+     * --------------------------------------------------
+     * 10. HARD POLICY BLOCK
+     * --------------------------------------------------
+     *
+     * IMPORTANT:
+     *
+     * Never execute STOP just because validation
+     * returned a policy block.
+     *
+     * A blocked case should remain in its current state.
+     */
+
+    if (
+      policyValidation.executionAllowed !==
+      true
+    ) {
+      return res.status(409).json({
+        success: false,
+
+        message:
+          policyValidation.message ||
+          'Policy does not allow execution for this case.',
+
+        data: {
+          recoveryCaseId:
+            recoveryCase._id,
+
+          currentStatus:
+            recoveryCase.status,
+
+          storedAIAction:
+            storedFinalAction,
+
+          policyValidation,
+
+          executionAllowed:
+            false,
+
+          recoveryConfirmed:
+            false,
+        },
+      });
+    }
+
+    /*
+     * --------------------------------------------------
+     * 11. DETERMINE THE ONLY ACTION WE MAY EXECUTE
+     * --------------------------------------------------
+     *
+     * If the persisted action is still allowed,
+     * execute that SAME action.
+     *
+     * We are NOT calling decideRecoveryAction().
+     */
+
+    const finalAction =
+      policyValidation.finalAction;
+
+    if (!finalAction) {
+      return res.status(409).json({
+        success: false,
+
+        message:
+          'Policy validation did not produce an executable final action.',
+
+        data: {
+          recoveryCaseId:
+            recoveryCase._id,
+
+          policyValidation,
+
+          executionAllowed:
+            false,
+        },
+      });
+    }
+
+    /*
+     * --------------------------------------------------
+     * 12. EXECUTE THE VALIDATED AI ACTION
+     * --------------------------------------------------
+     */
 
     const execution =
       await executeRecoveryAction({
@@ -530,14 +998,37 @@ async function decideAndExecuteRecovery(
           recoveryCase._id,
 
         action:
-          decision.action,
+          finalAction,
 
         reason:
-          decision.reason,
-
-        actor:
-          'RECOVERY_ENGINE',
+          policyValidation
+            .aiRecommendation
+            ?.reason ||
+          recoveryCase
+            .agentDecision
+            .rationale ||
+          'Validated AI recovery action.',
       });
+
+    /*
+     * --------------------------------------------------
+     * 13. LOAD UPDATED CASE
+     * --------------------------------------------------
+     */
+
+    const updatedCase =
+      await RecoveryCase.findOne({
+        _id:
+          recoveryCase._id,
+
+        merchantId,
+      }).lean();
+
+    /*
+     * --------------------------------------------------
+     * 14. RETURN COMPLETE PIPELINE RESULT
+     * --------------------------------------------------
+     */
 
     return res.status(200).json({
       success: true,
@@ -560,28 +1051,48 @@ async function decideAndExecuteRecovery(
         caseType:
           recoveryCase.type,
 
-        currentStatus:
-          execution.status,
+        aiDecision:
+          recoveryCase.agentDecision,
 
-        decision,
+        policyValidation,
+
+        finalAction,
 
         execution,
 
+        currentStatus:
+          updatedCase?.status ||
+          execution.status,
+
+        currentAction:
+          updatedCase?.currentAction ||
+          execution.action ||
+          finalAction,
+
         recoveryConfirmed:
-          false,
+          updatedCase?.status ===
+          'RECOVERED',
+
+        awaitingPaymentConfirmation:
+          updatedCase?.status ===
+          'ACTION_EXECUTED',
 
         message:
-          'Recovery decision processed. Money is counted as recovered only after payment confirmation.',
+          execution.status ===
+          'ACTION_EXECUTED'
+            ? 'Validated AI recovery action executed. Money is counted as recovered only after payment confirmation.'
+            : 'Recovery action processed successfully.',
       },
     });
   } catch (error) {
     console.error(
-      'Recovery decision/execution error:',
+      'Recovery AI execution error:',
       error,
     );
 
     if (
-      error.name === 'CastError'
+      error.name ===
+      'CastError'
     ) {
       return res.status(400).json({
         success: false,
@@ -594,11 +1105,10 @@ async function decideAndExecuteRecovery(
       success: false,
       message:
         error.message ||
-        'Failed to process recovery case.',
+        'Failed to execute the validated recovery action.',
     });
   }
 }
-
 /**
  * POST /api/recovery/confirm
  */
@@ -691,10 +1201,131 @@ async function confirmRecoveryController(
   }
 }
 
+async function simulateRecoveryPaymentController(
+  req,
+  res,
+) {
+  try {
+    const {
+      recoveryCaseId,
+    } = req.body || {};
+
+    const merchantId =
+      req.user?.userId;
+
+    if (!merchantId) {
+      return res.status(401).json({
+        success: false,
+        message:
+          'Authenticated merchant could not be resolved.',
+      });
+    }
+
+    if (!recoveryCaseId) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'recoveryCaseId is required.',
+      });
+    }
+
+    const result =
+      await simulateSuccessfulRecoveryPayment({
+        recoveryCaseId,
+        merchantId,
+      });
+
+    return res.status(200).json({
+      success: true,
+
+      data: result,
+    });
+  } catch (error) {
+    console.error(
+      'Simulated recovery payment error:',
+      error,
+    );
+
+    if (
+      error.name === 'CastError'
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'Invalid recoveryCaseId.',
+      });
+    }
+
+    return res.status(400).json({
+      success: false,
+      message:
+        error.message ||
+        'Failed to simulate recovery payment.',
+    });
+  }
+}
+
+async function executeRecoveryCasesInBulkController(
+  req,
+  res,
+) {
+  try {
+    const merchantId =
+      req.user?.userId;
+
+    if (!merchantId) {
+      return res.status(401).json({
+        success: false,
+        message:
+          'Authenticated merchant could not be resolved.',
+      });
+    }
+
+    const {
+      recoveryCaseIds,
+    } = req.body || {};
+
+    if (
+      !Array.isArray(recoveryCaseIds) ||
+      recoveryCaseIds.length === 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'At least one recovery case is required.',
+      });
+    }
+
+    const result =
+      await executeRecoveryCasesInBulk({
+        merchantId,
+        recoveryCaseIds,
+      });
+
+    return res.status(200).json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    console.error(
+      'executeRecoveryCasesInBulkController error:',
+      error,
+    );
+
+    return res.status(400).json({
+      success: false,
+      message:
+        error.message ||
+        'Failed to execute recovery cases in bulk.',
+    });
+  }
+}
 module.exports = {
   getRecoveryCases,
   getRecoveryCaseTimeline,
   runAIRecoveryAnalysisController,
   decideAndExecuteRecovery,
+  executeRecoveryCasesInBulkController,
   confirmRecoveryController,
+  simulateRecoveryPaymentController,
 };

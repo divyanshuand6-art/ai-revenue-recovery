@@ -15,8 +15,7 @@ async function connectToDatabase() {
   const mongoUri = process.env.MONGODB_URI;
 
   if (!mongoUri) {
-    console.warn('MongoDB connection skipped: MONGODB_URI is not configured.');
-    return false;
+    throw new Error('MONGODB_URI is not configured.');
   }
 
   try {
@@ -28,7 +27,7 @@ async function connectToDatabase() {
     return true;
   } catch (error) {
     console.error('MongoDB connection failed:', error.message);
-    return false;
+    throw error;
   }
 }
 

@@ -11,14 +11,19 @@ const {
 const { configureDnsServers } = require('./config/dns');
 
 const port = Number.parseInt(process.env.PORT, 10) || 5000;
+const host = process.env.HOST || '0.0.0.0';
 
 async function startServer() {
   configureDnsServers();
   await connectToDatabase();
 
-  const server = app.listen(port, () => {
-    console.info(`AI Revenue Recovery backend listening on port ${port}.`);
-  });
+
+
+const server = app.listen(port, host, () => {
+  console.info(
+    `AI Revenue Recovery backend listening on ${host}:${port}.`
+  );
+});
 
   const shutdown = async (signal) => {
     console.info(`${signal} received. Shutting down gracefully.`);

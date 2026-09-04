@@ -26,7 +26,22 @@ const FAILURE_CATEGORIES = Object.freeze({
   MANDATE_ERROR: 'MANDATE_ERROR',
 });
 
-function isRecoveryWindowExpired(recoveryWindowEndsAt, now = new Date()) {
+const CUSTOMER_OUTREACH_ACTIONS = Object.freeze([
+  ACTIONS.RECOVERY_LINK,
+  ACTIONS.ALTERNATIVE_PAYMENT,
+  ACTIONS.REMINDER,
+  ACTIONS.FOLLOW_UP,
+]);
+
+/**
+ * ----------------------------------------------------
+ * CHECK WHETHER RECOVERY WINDOW HAS EXPIRED
+ * ----------------------------------------------------
+ */
+function isRecoveryWindowExpired(
+  recoveryWindowEndsAt,
+  now = new Date(),
+) {
   if (!recoveryWindowEndsAt) {
     return true;
   }
@@ -40,12 +55,31 @@ function isRecoveryWindowExpired(recoveryWindowEndsAt, now = new Date()) {
   return now >= windowEnd;
 }
 
+/**
+ * ----------------------------------------------------
+ * GET SAFE POLICY VALUE
+ * ----------------------------------------------------
+ *
+ * Only non-negative safe integers are accepted.
+ * Otherwise the configured fallback is used.
+ */
 function getPolicyValue(value, fallback) {
   return Number.isSafeInteger(value) && value >= 0
     ? value
     : fallback;
 }
 
+/**
+ * ----------------------------------------------------
+ * DECIDE RECOVERY ACTION
+ * ----------------------------------------------------
+ *
+ * This is the deterministic policy layer.
+ *
+ * IMPORTANT:
+ * AI does NOT decide whether an action is allowed.
+ * AI recommendations are checked against this policy.
+ */
 function decideRecoveryAction({
   failureCategory,
   caseType,
@@ -69,30 +103,31 @@ function decideRecoveryAction({
     2,
   );
 
-  /*
-   * ----------------------------------------------------
+  /**
+   * --------------------------------------------------
    * SAFETY CHECK 1
-   * ----------------------------------------------------
+   * --------------------------------------------------
+   *
    * Terminal cases must never be processed again.
    */
-
   if (TERMINAL_STATUSES.includes(status)) {
     return {
       action: ACTIONS.STOP,
       reasonCode: 'TERMINAL_CASE',
-      reason: `Recovery case is already in terminal status: ${status}.`,
+      reason:
+        `Recovery case is already in terminal status: ${status}.`,
       bounded: true,
       requiresCustomerAction: false,
     };
   }
 
-  /*
-   * ----------------------------------------------------
+  /**
+   * --------------------------------------------------
    * SAFETY CHECK 2
-   * ----------------------------------------------------
+   * --------------------------------------------------
+   *
    * Recovery window must still be active.
    */
-
   if (
     isRecoveryWindowExpired(
       recoveryWindowEndsAt,
@@ -108,48 +143,56 @@ function decideRecoveryAction({
     };
   }
 
-  /*
-   * ----------------------------------------------------
+  /**
+   * --------------------------------------------------
    * SAFETY CHECK 3
-   * ----------------------------------------------------
+   * --------------------------------------------------
+   *
    * Nothing is eligible for recovery.
    */
-
-  if (eligibleAmountMinor <= 0) {
+  if (
+    !Number.isFinite(eligibleAmountMinor) ||
+    eligibleAmountMinor <= 0
+  ) {
     return {
       action: ACTIONS.STOP,
       reasonCode: 'NO_ELIGIBLE_AMOUNT',
-      reason: 'No eligible amount remains for recovery.',
+      reason:
+        'No eligible amount remains for recovery.',
       bounded: true,
       requiresCustomerAction: false,
     };
   }
 
-  /*
-   * ----------------------------------------------------
+  /**
+   * --------------------------------------------------
    * SAFETY CHECK 4
-   * ----------------------------------------------------
+   * --------------------------------------------------
+   *
    * Full eligible amount has already been recovered.
    */
-
-  if (recoveredAmountMinor >= eligibleAmountMinor) {
+  if (
+    Number.isFinite(recoveredAmountMinor) &&
+    recoveredAmountMinor >= eligibleAmountMinor
+  ) {
     return {
       action: ACTIONS.STOP,
       reasonCode: 'ALREADY_RECOVERED',
-      reason: 'Eligible amount has already been recovered.',
+      reason:
+        'Eligible amount has already been recovered.',
       bounded: true,
       requiresCustomerAction: false,
     };
   }
 
-  /*
-   * ----------------------------------------------------
+  /**
+   * --------------------------------------------------
    * SAFETY CHECK 5
-   * ----------------------------------------------------
-   * Prevent duplicate execution of an already scheduled
-   * action.
+   * --------------------------------------------------
+   *
+   * Prevent duplicate execution of an already
+   * scheduled action.
    */
-
   if (
     status === 'ACTION_SCHEDULED' &&
     currentAction
@@ -157,18 +200,41 @@ function decideRecoveryAction({
     return {
       action: ACTIONS.STOP,
       reasonCode: 'ACTION_ALREADY_SCHEDULED',
-      reason: `Action ${currentAction} is already scheduled.`,
+      reason:
+        `Action ${currentAction} is already scheduled.`,
       bounded: true,
       requiresCustomerAction: false,
     };
   }
 
-  /*
-   * ----------------------------------------------------
-   * CHECKOUT ABANDONMENT
-   * ----------------------------------------------------
+  /**
+   * --------------------------------------------------
+   * SAFETY CHECK 6
+   * --------------------------------------------------
+   *
+   * Prevent another action while the previous
+   * action is awaiting payment confirmation.
    */
+  if (
+    status === 'ACTION_EXECUTED' &&
+    currentAction
+  ) {
+    return {
+      action: ACTIONS.STOP,
+      reasonCode:
+        'ACTION_AWAITING_PAYMENT_CONFIRMATION',
+      reason:
+        `Action ${currentAction} is awaiting payment confirmation.`,
+      bounded: true,
+      requiresCustomerAction: false,
+    };
+  }
 
+  /**
+   * --------------------------------------------------
+   * CHECKOUT ABANDONMENT
+   * --------------------------------------------------
+   */
   if (caseType === 'CHECKOUT_ABANDONMENT') {
     if (reminderCount >= maxReminders) {
       return {
@@ -191,22 +257,29 @@ function decideRecoveryAction({
     };
   }
 
-  /*
-   * ----------------------------------------------------
+  /**
+   * --------------------------------------------------
    * SUBSCRIPTION PAYMENT FAILURE
-   * ----------------------------------------------------
+   * --------------------------------------------------
    */
-
   if (
     caseType === 'SUBSCRIPTION_PAYMENT_FAILURE'
   ) {
+    /**
+     * Retry limit reached.
+     */
     if (
       retryAttemptCount >= maxPaymentRetries
     ) {
+      /**
+       * Retry limit reached but reminders
+       * are still available.
+       */
       if (reminderCount < maxReminders) {
         return {
           action: ACTIONS.REMINDER,
-          reasonCode: 'PAYMENT_RETRY_LIMIT_REACHED',
+          reasonCode:
+            'PAYMENT_RETRY_LIMIT_REACHED',
           reason:
             'Payment retry limit reached; send a controlled reminder.',
           bounded: true,
@@ -214,6 +287,9 @@ function decideRecoveryAction({
         };
       }
 
+      /**
+       * Both retry and reminder limits reached.
+       */
       return {
         action: ACTIONS.ESCALATE,
         reasonCode: 'RECOVERY_LIMIT_REACHED',
@@ -224,6 +300,10 @@ function decideRecoveryAction({
       };
     }
 
+    /**
+     * Insufficient funds should not trigger
+     * an immediate retry.
+     */
     if (
       failureCategory ===
       FAILURE_CATEGORIES.INSUFFICIENT_FUNDS
@@ -238,6 +318,9 @@ function decideRecoveryAction({
       };
     }
 
+    /**
+     * Subscription mandate failure.
+     */
     if (
       failureCategory ===
       FAILURE_CATEGORIES.MANDATE_ERROR
@@ -252,9 +335,13 @@ function decideRecoveryAction({
       };
     }
 
+    /**
+     * Default subscription payment retry.
+     */
     return {
       action: ACTIONS.PAYMENT_RETRY,
-      reasonCode: 'SUBSCRIPTION_PAYMENT_FAILURE',
+      reasonCode:
+        'SUBSCRIPTION_PAYMENT_FAILURE',
       reason:
         'Subscription payment failed and another bounded retry is allowed.',
       bounded: true,
@@ -262,25 +349,26 @@ function decideRecoveryAction({
     };
   }
 
-  /*
-   * ----------------------------------------------------
+  /**
+   * --------------------------------------------------
    * NORMAL PAYMENT FAILURE
-   * ----------------------------------------------------
+   * --------------------------------------------------
    */
-
   if (caseType === 'PAYMENT_FAILURE') {
-    /*
-     * Once payment retry limit is reached, don't keep
-     * retrying indefinitely.
+    /**
+     * Retry limit reached.
      */
-
     if (
       retryAttemptCount >= maxPaymentRetries
     ) {
+      /**
+       * Reminder is still available.
+       */
       if (reminderCount < maxReminders) {
         return {
           action: ACTIONS.REMINDER,
-          reasonCode: 'PAYMENT_RETRY_LIMIT_REACHED',
+          reasonCode:
+            'PAYMENT_RETRY_LIMIT_REACHED',
           reason:
             'Payment retry limit reached; customer reminder is allowed.',
           bounded: true,
@@ -288,6 +376,9 @@ function decideRecoveryAction({
         };
       }
 
+      /**
+       * No retries or reminders remain.
+       */
       return {
         action: ACTIONS.ESCALATE,
         reasonCode: 'RECOVERY_LIMIT_REACHED',
@@ -298,7 +389,13 @@ function decideRecoveryAction({
       };
     }
 
+    /**
+     * Failure-specific recovery strategy.
+     */
     switch (failureCategory) {
+      /**
+       * Temporary network failure.
+       */
       case FAILURE_CATEGORIES.NETWORK_ERROR:
         return {
           action: ACTIONS.PAYMENT_RETRY,
@@ -309,6 +406,9 @@ function decideRecoveryAction({
           requiresCustomerAction: false,
         };
 
+      /**
+       * Temporary payment processing failure.
+       */
       case FAILURE_CATEGORIES.PROCESSING_ERROR:
         return {
           action: ACTIONS.PAYMENT_RETRY,
@@ -319,6 +419,9 @@ function decideRecoveryAction({
           requiresCustomerAction: false,
         };
 
+      /**
+       * Insufficient funds.
+       */
       case FAILURE_CATEGORIES.INSUFFICIENT_FUNDS:
         return {
           action: ACTIONS.DELAYED_RETRY,
@@ -329,6 +432,9 @@ function decideRecoveryAction({
           requiresCustomerAction: false,
         };
 
+      /**
+       * Authentication requires customer action.
+       */
       case FAILURE_CATEGORIES.AUTHENTICATION_FAILED:
         return {
           action: ACTIONS.RECOVERY_LINK,
@@ -339,6 +445,9 @@ function decideRecoveryAction({
           requiresCustomerAction: true,
         };
 
+      /**
+       * Bank declined the payment.
+       */
       case FAILURE_CATEGORIES.BANK_DECLINED:
         return {
           action: ACTIONS.ALTERNATIVE_PAYMENT,
@@ -349,6 +458,9 @@ function decideRecoveryAction({
           requiresCustomerAction: true,
         };
 
+      /**
+       * Mandate failure.
+       */
       case FAILURE_CATEGORIES.MANDATE_ERROR:
         return {
           action: ACTIONS.ALTERNATIVE_PAYMENT,
@@ -359,6 +471,12 @@ function decideRecoveryAction({
           requiresCustomerAction: true,
         };
 
+      /**
+       * Unknown failure.
+       *
+       * Do not automatically retry an unknown
+       * failure.
+       */
       default:
         return {
           action: ACTIONS.FOLLOW_UP,
@@ -371,12 +489,11 @@ function decideRecoveryAction({
     }
   }
 
-  /*
-   * ----------------------------------------------------
+  /**
+   * --------------------------------------------------
    * UNKNOWN CASE TYPE
-   * ----------------------------------------------------
+   * --------------------------------------------------
    */
-
   return {
     action: ACTIONS.FOLLOW_UP,
     reasonCode: 'UNKNOWN_CASE_TYPE',
@@ -387,9 +504,387 @@ function decideRecoveryAction({
   };
 }
 
+/**
+ * ----------------------------------------------------
+ * COMMUNICATION CONSENT
+ * ----------------------------------------------------
+ *
+ * Customer-facing actions require at least one
+ * permitted communication channel.
+ */
+function hasCommunicationConsent(
+  communicationConsent = {},
+) {
+  return Boolean(
+    communicationConsent.email ||
+    communicationConsent.sms ||
+    communicationConsent.whatsapp,
+  );
+}
+
+/**
+ * ----------------------------------------------------
+ * GET RECOVERY POLICY CONSTRAINTS
+ * ----------------------------------------------------
+ *
+ * This function converts the deterministic policy
+ * decision into executable constraints for the AI
+ * recommendation validator.
+ */
+function getRecoveryPolicyConstraints({
+  failureCategory,
+  caseType,
+  status,
+  retryAttemptCount = 0,
+  reminderCount = 0,
+  eligibleAmountMinor = 0,
+  recoveredAmountMinor = 0,
+  recoveryWindowEndsAt,
+  policySnapshot = {},
+  currentAction = null,
+  communicationConsent = {},
+  now = new Date(),
+}) {
+  const policyDecision =
+    decideRecoveryAction({
+      failureCategory,
+      caseType,
+      status,
+      retryAttemptCount,
+      reminderCount,
+      eligibleAmountMinor,
+      recoveredAmountMinor,
+      recoveryWindowEndsAt,
+      policySnapshot,
+      currentAction,
+      now,
+    });
+
+  /**
+   * These conditions completely block execution.
+   */
+  const blockedReasonCodes = new Set([
+    'TERMINAL_CASE',
+    'RECOVERY_WINDOW_EXPIRED',
+    'NO_ELIGIBLE_AMOUNT',
+    'ALREADY_RECOVERED',
+    'ACTION_ALREADY_SCHEDULED',
+    'ACTION_AWAITING_PAYMENT_CONFIRMATION',
+  ]);
+
+  /**
+   * These conditions force a specific action.
+   */
+  const forcedActionReasonCodes = new Set([
+    'REMINDER_LIMIT_REACHED',
+    'RECOVERY_LIMIT_REACHED',
+  ]);
+
+  /**
+   * Completely blocked case.
+   */
+  if (
+    blockedReasonCodes.has(
+      policyDecision.reasonCode,
+    )
+  ) {
+    return {
+      blocked: true,
+      reasonCode:
+        policyDecision.reasonCode,
+      message:
+        policyDecision.reason,
+      allowedActions: [],
+      fallbackAction: null,
+      policyDecision,
+    };
+  }
+
+  /**
+   * Policy requires a specific action.
+   */
+  if (
+    forcedActionReasonCodes.has(
+      policyDecision.reasonCode,
+    )
+  ) {
+    return {
+      blocked: false,
+      reasonCode:
+        policyDecision.reasonCode,
+      message:
+        policyDecision.reason,
+      allowedActions: [
+        policyDecision.action,
+      ],
+      fallbackAction:
+        policyDecision.action,
+      policyDecision,
+    };
+  }
+
+  const maxPaymentRetries = getPolicyValue(
+    policySnapshot.maxPaymentRetries,
+    3,
+  );
+
+  const maxReminders = getPolicyValue(
+    policySnapshot.maxReminders,
+    2,
+  );
+
+  /**
+   * STOP and ESCALATE are always available for
+   * non-blocked recovery cases.
+   */
+  const allowedActions = new Set([
+    ACTIONS.STOP,
+    ACTIONS.ESCALATE,
+  ]);
+
+  /**
+   * --------------------------------------------------
+   * CHECKOUT ABANDONMENT ACTIONS
+   * --------------------------------------------------
+   */
+  if (
+    caseType === 'CHECKOUT_ABANDONMENT'
+  ) {
+    allowedActions.add(
+      ACTIONS.RECOVERY_LINK,
+    );
+
+    allowedActions.add(
+      ACTIONS.REMINDER,
+    );
+
+    allowedActions.add(
+      ACTIONS.FOLLOW_UP,
+    );
+  }
+
+  /**
+   * --------------------------------------------------
+   * PAYMENT FAILURE ACTIONS
+   * --------------------------------------------------
+   */
+  else if (
+    caseType === 'PAYMENT_FAILURE' ||
+    caseType ===
+      'SUBSCRIPTION_PAYMENT_FAILURE'
+  ) {
+    /**
+     * Temporary technical errors.
+     */
+    if (
+      failureCategory ===
+        FAILURE_CATEGORIES.NETWORK_ERROR ||
+      failureCategory ===
+        FAILURE_CATEGORIES.PROCESSING_ERROR
+    ) {
+      allowedActions.add(
+        ACTIONS.PAYMENT_RETRY,
+      );
+
+      allowedActions.add(
+        ACTIONS.DELAYED_RETRY,
+      );
+
+      allowedActions.add(
+        ACTIONS.RECOVERY_LINK,
+      );
+
+      allowedActions.add(
+        ACTIONS.FOLLOW_UP,
+      );
+    }
+
+    /**
+     * Insufficient funds.
+     */
+    else if (
+      failureCategory ===
+      FAILURE_CATEGORIES.INSUFFICIENT_FUNDS
+    ) {
+      allowedActions.add(
+        ACTIONS.DELAYED_RETRY,
+      );
+
+      allowedActions.add(
+        ACTIONS.RECOVERY_LINK,
+      );
+
+      allowedActions.add(
+        ACTIONS.REMINDER,
+      );
+
+      allowedActions.add(
+        ACTIONS.FOLLOW_UP,
+      );
+
+      allowedActions.add(
+        ACTIONS.ALTERNATIVE_PAYMENT,
+      );
+    }
+
+    /**
+     * Authentication, bank decline and mandate
+     * failures require customer-facing recovery.
+     */
+    else if (
+      failureCategory ===
+        FAILURE_CATEGORIES.AUTHENTICATION_FAILED ||
+      failureCategory ===
+        FAILURE_CATEGORIES.BANK_DECLINED ||
+      failureCategory ===
+        FAILURE_CATEGORIES.MANDATE_ERROR
+    ) {
+      allowedActions.add(
+        ACTIONS.RECOVERY_LINK,
+      );
+
+      allowedActions.add(
+        ACTIONS.ALTERNATIVE_PAYMENT,
+      );
+
+      allowedActions.add(
+        ACTIONS.REMINDER,
+      );
+
+      allowedActions.add(
+        ACTIONS.FOLLOW_UP,
+      );
+    }
+
+    /**
+     * Unknown failure.
+     */
+    else {
+      allowedActions.add(
+        ACTIONS.RECOVERY_LINK,
+      );
+
+      allowedActions.add(
+        ACTIONS.REMINDER,
+      );
+
+      allowedActions.add(
+        ACTIONS.FOLLOW_UP,
+      );
+    }
+  }
+
+  /**
+   * --------------------------------------------------
+   * UNKNOWN CASE TYPE
+   * --------------------------------------------------
+   */
+  else {
+    allowedActions.add(
+      ACTIONS.FOLLOW_UP,
+    );
+  }
+
+  /**
+   * --------------------------------------------------
+   * RETRY LIMIT
+   * --------------------------------------------------
+   *
+   * Once the retry limit has been reached,
+   * neither immediate nor delayed retry is allowed.
+   */
+  if (
+    retryAttemptCount >= maxPaymentRetries
+  ) {
+    allowedActions.delete(
+      ACTIONS.PAYMENT_RETRY,
+    );
+
+    allowedActions.delete(
+      ACTIONS.DELAYED_RETRY,
+    );
+  }
+
+  /**
+   * --------------------------------------------------
+   * REMINDER LIMIT
+   * --------------------------------------------------
+   *
+   * All customer-outreach actions represented by
+   * CUSTOMER_OUTREACH_ACTIONS are removed once the
+   * reminder limit has been reached.
+   */
+  if (
+    reminderCount >= maxReminders
+  ) {
+    for (
+      const action of CUSTOMER_OUTREACH_ACTIONS
+    ) {
+      allowedActions.delete(action);
+    }
+  }
+
+  /**
+   * --------------------------------------------------
+   * COMMUNICATION CONSENT
+   * --------------------------------------------------
+   *
+   * Never perform customer-facing outreach when
+   * there is no communication consent.
+   */
+  if (
+    !hasCommunicationConsent(
+      communicationConsent,
+    )
+  ) {
+    for (
+      const action of CUSTOMER_OUTREACH_ACTIONS
+    ) {
+      allowedActions.delete(action);
+    }
+  }
+
+  /**
+   * --------------------------------------------------
+   * DETERMINE FALLBACK
+   * --------------------------------------------------
+   */
+  const defaultActionIsAllowed =
+    allowedActions.has(
+      policyDecision.action,
+    );
+
+  const fallbackAction =
+    defaultActionIsAllowed
+      ? policyDecision.action
+      : allowedActions.has(
+          ACTIONS.ESCALATE,
+        )
+        ? ACTIONS.ESCALATE
+        : ACTIONS.STOP;
+
+  return {
+    blocked: false,
+    reasonCode:
+      policyDecision.reasonCode,
+    message:
+      policyDecision.reason,
+    allowedActions:
+      Array.from(allowedActions),
+    fallbackAction,
+    policyDecision,
+  };
+}
+
+/**
+ * ----------------------------------------------------
+ * EXPORTS
+ * ----------------------------------------------------
+ */
 module.exports = {
   ACTIONS,
   FAILURE_CATEGORIES,
   decideRecoveryAction,
+  getRecoveryPolicyConstraints,
   isRecoveryWindowExpired,
 };

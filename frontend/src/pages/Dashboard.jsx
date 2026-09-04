@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import apiClient from '../api/client';
 
 function formatCurrency(value) {
@@ -22,6 +22,14 @@ function formatLabel(value) {
     );
 }
 
+function formatLocalDate(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+
+  return `${year}-${month}-${day}`;
+}
+
 function getDefaultFromDate() {
   const date = new Date();
 
@@ -29,15 +37,11 @@ function getDefaultFromDate() {
     date.getDate() - 30,
   );
 
-  return date
-    .toISOString()
-    .slice(0, 10);
+  return formatLocalDate(date);
 }
 
 function getDefaultToDate() {
-  return new Date()
-    .toISOString()
-    .slice(0, 10);
+  return formatLocalDate(new Date());
 }
 
 function getRecoveryRate(item) {
@@ -68,6 +72,13 @@ function Dashboard() {
   const [error, setError] =
     useState('');
 
+  const fromRef = useRef(from);
+  const toRef = useRef(to);
+  const dashboardRequestInFlightRef = useRef(false);
+
+  fromRef.current = from;
+  toRef.current = to;
+
   /*
    * --------------------------------------------------
    * LOAD DASHBOARD
@@ -75,9 +86,15 @@ function Dashboard() {
    */
 
   async function loadDashboard(
-    selectedFrom = from,
-    selectedTo = to,
+    selectedFrom = fromRef.current,
+    selectedTo = toRef.current,
   ) {
+    if (dashboardRequestInFlightRef.current) {
+      return;
+    }
+
+    dashboardRequestInFlightRef.current = true;
+
     try {
       setLoading(true);
       setError('');
@@ -108,12 +125,36 @@ function Dashboard() {
           'Failed to load dashboard analytics.',
       );
     } finally {
+      dashboardRequestInFlightRef.current = false;
       setLoading(false);
     }
   }
 
   useEffect(() => {
     loadDashboard();
+
+    const refreshInterval = window.setInterval(() => {
+      loadDashboard(
+        fromRef.current,
+        toRef.current,
+      );
+    }, 5000);
+
+    const handleFocus = () => {
+      loadDashboard(
+        fromRef.current,
+        toRef.current,
+      );
+    };
+
+    window.addEventListener('focus', handleFocus);
+
+    return () => {
+      window.clearInterval(refreshInterval);
+      window.removeEventListener('focus', handleFocus);
+    };
+
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /*

@@ -417,6 +417,48 @@ const recoveryCaseSchema =
           enum: recoveryActions,
         },
 
+        recommendedAction: {
+          type: String,
+
+          enum: recoveryActions,
+        },
+
+        finalAction: {
+          type: String,
+
+          enum: recoveryActions,
+        },
+
+        policyAccepted: {
+          type: Boolean,
+        },
+
+        riskLevel: {
+          type: String,
+
+          enum: [
+            'LOW',
+            'MEDIUM',
+            'HIGH',
+          ],
+        },
+
+        provider: {
+          type: String,
+
+          trim: true,
+
+          maxlength: 80,
+        },
+
+        policyReasonCode: {
+          type: String,
+
+          trim: true,
+
+          maxlength: 100,
+        },
+
         confidence: {
           type: Number,
 

@@ -19,7 +19,15 @@ const dashboardRoutes =
 
 const app = express();
 
+const razorpayWebhookRoutes =
+  require('./routes/razorpayWebhookRoutes');
+
 app.use(cors());
+
+app.use(
+  '/api/webhooks',
+  razorpayWebhookRoutes,
+);
 
 app.use(
   express.json({

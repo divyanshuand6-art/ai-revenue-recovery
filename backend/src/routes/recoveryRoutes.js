@@ -5,6 +5,7 @@ const {
   getRecoveryCaseTimeline,
   runAIRecoveryAnalysisController,
   decideAndExecuteRecovery,
+  executeRecoveryCasesInBulkController,
   confirmRecoveryController,
 } = require('../controllers/recoveryController');
 
@@ -16,6 +17,12 @@ const router = express.Router();
 
 router.use(requireAuth);
 
+/*
+ * --------------------------------------------------
+ * RECOVERY CASES
+ * --------------------------------------------------
+ */
+
 router.get(
   '/cases',
   getRecoveryCases,
@@ -26,15 +33,44 @@ router.get(
   getRecoveryCaseTimeline,
 );
 
+/*
+ * --------------------------------------------------
+ * AI ANALYSIS
+ * --------------------------------------------------
+ */
+
 router.post(
   '/ai-analysis',
   runAIRecoveryAnalysisController,
 );
 
+/*
+ * --------------------------------------------------
+ * SINGLE EXECUTION
+ * --------------------------------------------------
+ */
+
 router.post(
   '/execute',
   decideAndExecuteRecovery,
 );
+
+/*
+ * --------------------------------------------------
+ * BULK EXECUTION
+ * --------------------------------------------------
+ */
+
+router.post(
+  '/execute-batch',
+  executeRecoveryCasesInBulkController,
+);
+
+/*
+ * --------------------------------------------------
+ * PAYMENT CONFIRMATION
+ * --------------------------------------------------
+ */
 
 router.post(
   '/confirm',

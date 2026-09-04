@@ -4,6 +4,9 @@ import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
 import RecoveryCases from './pages/RecoveryCases';
 
+console.log('APP LOADED - RECOVERY CASES VERSION 1');
+console.log('RecoveryCases component:', RecoveryCases);
+
 function App() {
   const [authenticated, setAuthenticated] =
     useState(

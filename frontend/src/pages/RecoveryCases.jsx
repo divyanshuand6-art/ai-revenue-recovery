@@ -1,4 +1,10 @@
-import { useMemo, useState } from 'react';
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import apiClient from '../api/client';
 
 const STATUS_OPTIONS = [
@@ -16,6 +22,23 @@ const STATUS_OPTIONS = [
 
 const CASES_PER_PAGE = 25;
 
+function formatDateInput(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function getDefaultFromDate() {
+  const date = new Date();
+  date.setDate(date.getDate() - 30);
+  return formatDateInput(date);
+}
+
+function getDefaultToDate() {
+  return formatDateInput(new Date());
+}
+
 const ACTION_REQUIRED_STATUSES = new Set([
   'ACTION_SCHEDULED',
   'ACTION_EXECUTED',
@@ -29,7 +52,6 @@ const TERMINAL_STATUSES = new Set([
   'STOPPED',
   'ESCALATED',
 ]);
-
 
 
 function formatLabel(value) {
@@ -67,12 +89,29 @@ function formatDateTime(value) {
 }
 
 function RecoveryCases() {
+  /*
+   * The details panel is the actual scroll container.
+   * We preserve its scroll position while the 3-second
+   * payment-status polling refreshes the timeline.
+   */
+  const detailsCardRef = useRef(null);
+  const timelineScrollPositionRef = useRef(null);
+  const timelineLoadedRef = useRef(false);
+  const timelineRef = useRef([]);
+  const timelineRequestInFlightRef = useRef(false);
+
   const [cases, setCases] = useState([]);
   const [selectedCase, setSelectedCase] =
     useState(null);
 
   const [status, setStatus] =
     useState('ACTION_REQUIRED');
+
+  const [fromDate, setFromDate] =
+    useState(getDefaultFromDate);
+
+  const [toDate, setToDate] =
+    useState(getDefaultToDate);
 
   const [search, setSearch] =
     useState('');
@@ -125,26 +164,27 @@ function RecoveryCases() {
     setActionConfirmation,
   ] = useState(null);
 
-  /*
-   * --------------------------------------------------
-   * PAYMENT CONFIRMATION STATE
-   * --------------------------------------------------
-   */
-
   const [
-    paymentConfirmation,
-    setPaymentConfirmation,
+    bulkActionConfirmation,
+    setBulkActionConfirmation,
   ] = useState(null);
 
   const [
-    paymentAmount,
-    setPaymentAmount,
-  ] = useState('');
+    bulkExecutionLoading,
+    setBulkExecutionLoading,
+  ] = useState(false);
 
-  const [
-    paymentTransactionId,
-    setPaymentTransactionId,
-  ] = useState('');
+  /*
+   * --------------------------------------------------
+   * CUSTOMER PAYMENT LINK STATE
+   * --------------------------------------------------
+   */
+
+  const [paymentLink, setPaymentLink] =
+    useState(null);
+
+  const [paymentResult, setPaymentResult] =
+    useState(null);
 
   /*
    * --------------------------------------------------
@@ -219,6 +259,11 @@ function RecoveryCases() {
 
       setSelectedCase(null);
 
+      timelineScrollPositionRef.current =
+        null;
+      timelineLoadedRef.current = false;
+      timelineRef.current = [];
+
       setTimeline([]);
       setTimelineError('');
 
@@ -230,6 +275,9 @@ function RecoveryCases() {
       setAiError('');
 
       setExecutionResult(null);
+      setPaymentLink(null);
+
+      setPaymentResult(null);
 
       setCurrentPage(1);
     } catch (requestError) {
@@ -252,18 +300,20 @@ function RecoveryCases() {
   async function loadTimeline(
     recoveryCaseId,
   ) {
-    if (!recoveryCaseId) {
+    if (!recoveryCaseId || timelineRequestInFlightRef.current) {
       return;
     }
 
+    timelineRequestInFlightRef.current = true;
+
+    const isInitialTimelineLoad =
+      !timelineLoadedRef.current;
+
     try {
-      setTimelineLoading(true);
+      if (isInitialTimelineLoad) {
+        setTimelineLoading(true);
+      }
       setTimelineError('');
-
-      setTimeline([]);
-
-      setCustomer(null);
-      setSourceTransaction(null);
 
       const response =
         await apiClient.get(
@@ -273,18 +323,297 @@ function RecoveryCases() {
       const data =
         response.data?.data || {};
 
-      setCustomer(
-        data.customer || null,
-      );
+      const caseData =
+        data.case || null;
 
-      setSourceTransaction(
-        data.sourceTransaction ||
-          null,
-      );
+      if (caseData) {
+        setSelectedCase((currentCase) => {
+          if (!currentCase) {
+            return currentCase;
+          }
 
-      setTimeline(
-        data.timeline || [],
-      );
+          const fields = [
+            '_id','status','currentAction','actionTaken',
+            'amountAtRiskMinor','eligibleAmountMinor','recoveredAmountMinor',
+            'recoveryTransactionId','recoveredAt','retryAttemptCount',
+            'reminderCount','nextActionAt',
+          ];
+
+          const unchanged = fields.every(
+            (field) => currentCase[field] === caseData[field],
+          );
+
+          return unchanged ? currentCase : { ...currentCase, ...caseData };
+        });
+
+        setCases((currentCases) =>
+          currentCases.map((item) => {
+            if (String(item._id) !== String(caseData._id)) return item;
+            const fields = [
+              '_id','status','currentAction','actionTaken',
+              'amountAtRiskMinor','eligibleAmountMinor','recoveredAmountMinor',
+              'recoveryTransactionId','recoveredAt','retryAttemptCount',
+              'reminderCount','nextActionAt',
+            ];
+            const unchanged = fields.every(
+              (field) => item[field] === caseData[field],
+            );
+            return unchanged ? item : { ...item, ...caseData };
+          }),
+        );
+      }
+
+      const nextCustomer = data.customer || null;
+      const nextSourceTransaction = data.sourceTransaction || null;
+
+      setCustomer((currentCustomer) => {
+        if (!currentCustomer && !nextCustomer) return currentCustomer;
+        if (!currentCustomer || !nextCustomer) return nextCustomer;
+        const unchanged =
+          String(currentCustomer._id || '') === String(nextCustomer._id || '') &&
+          currentCustomer.fullName === nextCustomer.fullName &&
+          currentCustomer.email === nextCustomer.email &&
+          currentCustomer.phone === nextCustomer.phone;
+        return unchanged ? currentCustomer : nextCustomer;
+      });
+
+      setSourceTransaction((currentTransaction) => {
+        if (!currentTransaction && !nextSourceTransaction) return currentTransaction;
+        if (!currentTransaction || !nextSourceTransaction) return nextSourceTransaction;
+        const unchanged =
+          String(currentTransaction._id || '') === String(nextSourceTransaction._id || '') &&
+          currentTransaction.status === nextSourceTransaction.status &&
+          currentTransaction.amountMinor === nextSourceTransaction.amountMinor &&
+          currentTransaction.currency === nextSourceTransaction.currency &&
+          currentTransaction.paymentMethod === nextSourceTransaction.paymentMethod &&
+          currentTransaction.occurredAt === nextSourceTransaction.occurredAt;
+        return unchanged ? currentTransaction : nextSourceTransaction;
+      });
+
+      const loadedTimeline =
+        Array.isArray(data.timeline)
+          ? data.timeline
+          : [];
+
+      const previousTimeline =
+        timelineRef.current;
+
+      const timelineChanged =
+        previousTimeline.length !==
+          loadedTimeline.length ||
+        previousTimeline.some(
+          (previousEvent, index) => {
+            const nextEvent =
+              loadedTimeline[index];
+
+            if (!nextEvent) {
+              return true;
+            }
+
+            return (
+              String(previousEvent?._id) !==
+                String(nextEvent?._id) ||
+              previousEvent?.occurredAt !==
+                nextEvent?.occurredAt ||
+              previousEvent?.eventType !==
+                nextEvent?.eventType ||
+              previousEvent?.result !==
+                nextEvent?.result ||
+              previousEvent?.message !==
+                nextEvent?.message
+            );
+          },
+        );
+
+      if (timelineChanged) {
+        /*
+         * Capture the user's current position only when the
+         * timeline is actually going to change. Routine polling
+         * with unchanged audit events must not cause a repaint.
+         */
+        const detailsCard =
+          detailsCardRef.current;
+
+        if (detailsCard) {
+          const maxScrollTop =
+            Math.max(
+              0,
+              detailsCard.scrollHeight -
+                detailsCard.clientHeight,
+            );
+
+          const currentScrollTop =
+            detailsCard.scrollTop;
+
+          timelineScrollPositionRef.current = {
+            scrollTop: currentScrollTop,
+            distanceFromBottom:
+              Math.max(
+                0,
+                maxScrollTop -
+                  currentScrollTop,
+              ),
+            wasAtBottom:
+              maxScrollTop > 0 &&
+              maxScrollTop -
+                currentScrollTop <= 8,
+          };
+        } else {
+          timelineScrollPositionRef.current =
+            null;
+        }
+
+        timelineRef.current =
+          loadedTimeline;
+        setTimeline(loadedTimeline);
+      }
+
+      timelineLoadedRef.current = true;
+      /*
+       * --------------------------------------------------
+       * FIND LATEST RAZORPAY PAYMENT LINK
+       * --------------------------------------------------
+       */
+
+      const paymentLinkEvent =
+        [...loadedTimeline]
+          .reverse()
+          .find((event) => {
+            if (
+              event.eventType !==
+              'RECOVERY_ACTION_SELECTED'
+            ) {
+              return false;
+            }
+
+            const metadata =
+              event.metadata || {};
+
+            return Boolean(
+              metadata.razorpayPaymentLinkId &&
+              metadata.paymentLinkUrl,
+            );
+          });
+
+      if (paymentLinkEvent) {
+        const metadata = paymentLinkEvent.metadata || {};
+        const nextPaymentLink = {
+          created: true, reused: true,
+          paymentLinkId: metadata.razorpayPaymentLinkId,
+          paymentLinkUrl: metadata.paymentLinkUrl,
+          amountMinor: Number(metadata.amountMinor || metadata.paymentLinkAmountMinor || 0),
+          currency: metadata.currency || caseData?.currency || 'INR',
+          status: metadata.paymentLinkStatus || 'CREATED',
+          referenceId: metadata.referenceId || null,
+          expiresAt: metadata.expiresAt || null,
+          notification: {
+            email: String(metadata.notificationEmail) === 'true',
+            sms: String(metadata.notificationSms) === 'true',
+          },
+        };
+        setPaymentLink((current) => {
+          if (!current) return nextPaymentLink;
+          const same =
+            current.paymentLinkId === nextPaymentLink.paymentLinkId &&
+            current.paymentLinkUrl === nextPaymentLink.paymentLinkUrl &&
+            current.amountMinor === nextPaymentLink.amountMinor &&
+            current.currency === nextPaymentLink.currency &&
+            current.status === nextPaymentLink.status &&
+            current.referenceId === nextPaymentLink.referenceId &&
+            current.expiresAt === nextPaymentLink.expiresAt &&
+            current.notification?.email === nextPaymentLink.notification.email &&
+            current.notification?.sms === nextPaymentLink.notification.sms;
+          return same ? current : nextPaymentLink;
+        });
+      } else if (
+        caseData?.status !==
+        'ACTION_EXECUTED'
+      ) {
+        setPaymentLink(null);
+      }
+
+      /*
+       * --------------------------------------------------
+       * FIND SUCCESSFUL PAYMENT
+       * --------------------------------------------------
+       */
+
+      const paymentSuccessEvent =
+        [...loadedTimeline]
+          .reverse()
+          .find(
+            (event) =>
+              event.eventType ===
+              'PAYMENT_SUCCEEDED',
+          );
+
+      if (paymentSuccessEvent) {
+        const metadata =
+          paymentSuccessEvent.metadata || {};
+
+        const nextPaymentResult = {
+          success: true,
+
+          provider:
+            paymentSuccessEvent.actorType ===
+            'RAZORPAY'
+              ? 'Razorpay'
+              : paymentSuccessEvent.actorType,
+
+          /* Our MongoDB transaction ID. */
+          paymentTransactionId:
+            metadata.paymentTransactionId ||
+            caseData?.recoveryTransactionId ||
+            null,
+
+          /* Razorpay provider payment ID. */
+          razorpayPaymentId:
+            metadata.razorpayPaymentId ||
+            metadata.providerPaymentId ||
+            null,
+
+          paymentStatus:
+            metadata.paymentStatus ||
+            'CAPTURED',
+
+          amountMinor:
+            Number(
+              metadata.amountMinor ||
+                0,
+            ),
+
+          currency:
+            metadata.currency ||
+            caseData?.currency ||
+            'INR',
+
+          source:
+            metadata.source ||
+            'RAZORPAY',
+
+          recoveredAmountMinor:
+            Number(
+              caseData?.recoveredAmountMinor ||
+                metadata.amountMinor ||
+                0,
+            ),
+
+          recoveredAt:
+            caseData?.recoveredAt ||
+            paymentSuccessEvent.occurredAt ||
+            null,
+        };
+
+        setPaymentResult((current) => {
+          if (!current) return nextPaymentResult;
+          const keys = ['provider','paymentTransactionId','razorpayPaymentId','paymentStatus','amountMinor','currency','source','recoveredAmountMinor','recoveredAt'];
+          return keys.every((key) => current[key] === nextPaymentResult[key]) ? current : nextPaymentResult;
+        });
+      } else {
+        setPaymentResult((current) =>
+          current === null ? current : null,
+        );
+      }
     } catch (requestError) {
       setTimelineError(
         requestError.response?.data
@@ -292,9 +621,87 @@ function RecoveryCases() {
           'Failed to load case context.',
       );
     } finally {
-      setTimelineLoading(false);
+      timelineRequestInFlightRef.current =
+        false;
+
+      if (isInitialTimelineLoad) {
+        setTimelineLoading(false);
+      }
     }
   }
+
+  /*
+   * Restore the details-card scroll position after React has
+   * committed the refreshed timeline DOM.
+   *
+   * useLayoutEffect runs before the browser paints, so the user
+   * does not see the panel jump to the top between frames.
+   */
+  useLayoutEffect(() => {
+    const saved =
+      timelineScrollPositionRef.current;
+
+    const detailsCard =
+      detailsCardRef.current;
+
+    if (!saved || !detailsCard) {
+      return;
+    }
+
+    const maxScrollTop =
+      Math.max(
+        0,
+        detailsCard.scrollHeight -
+          detailsCard.clientHeight,
+      );
+
+    if (saved.wasAtBottom) {
+      detailsCard.scrollTop =
+        maxScrollTop;
+    } else {
+      detailsCard.scrollTop =
+        Math.min(
+          saved.scrollTop,
+          maxScrollTop,
+        );
+    }
+
+    timelineScrollPositionRef.current =
+      null;
+  }, [timeline]);
+
+  useEffect(() => {
+    loadCases(status);
+    // Initial data load only. Subsequent status/refresh actions
+    // explicitly call loadCases().
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (
+      !selectedCase?._id ||
+      selectedCase.status !==
+        'ACTION_EXECUTED'
+    ) {
+      return undefined;
+    }
+
+    const pollId =
+      window.setInterval(() => {
+        loadTimeline(
+          selectedCase._id,
+        );
+      }, 3000);
+
+    return () => {
+      window.clearInterval(
+        pollId,
+      );
+    };
+  }, [
+    selectedCase?._id,
+    selectedCase?.status,
+  ]);
 
   /*
    * --------------------------------------------------
@@ -303,6 +710,19 @@ function RecoveryCases() {
    */
 
   function handleCaseSelect(item) {
+    /*
+     * A new case should start at the top. Subsequent polling
+     * will preserve whatever position the user chooses.
+     */
+    timelineScrollPositionRef.current =
+      null;
+    timelineLoadedRef.current = false;
+    timelineRef.current = [];
+
+    if (detailsCardRef.current) {
+      detailsCardRef.current.scrollTop = 0;
+    }
+
     setSelectedCase(item);
 
     /*
@@ -315,6 +735,8 @@ function RecoveryCases() {
     setSourceTransaction(null);
 
     setExecutionResult(null);
+    setPaymentLink(null);
+    setPaymentResult(null);
 
     /*
      * Remove any old error but DO NOT
@@ -346,6 +768,11 @@ function RecoveryCases() {
 
     setSelectedCase(null);
 
+    timelineScrollPositionRef.current =
+      null;
+    timelineLoadedRef.current = false;
+    timelineRef.current = [];
+
     setAiResults([]);
     setAiRunSummary(null);
     setAiError('');
@@ -375,6 +802,122 @@ function RecoveryCases() {
    * the AI response is received.
    * --------------------------------------------------
    */
+
+  async function handleBatchAIAnalysis() {
+    if (fromDate && toDate && fromDate > toDate) {
+      setAiError('From date cannot be later than To date.');
+      return;
+    }
+
+    try {
+      setAiLoading(true);
+      setAiError('');
+      setExecutionResult(null);
+
+      const response = await apiClient.post(
+        '/recovery/ai-analysis',
+        {
+          batchMode: true,
+          from: fromDate || undefined,
+          to: toDate || undefined,
+          status: status === 'ALL' ? 'ALL' : status,
+          limit: 5000,
+          batchSize: 20,
+          activeOnly: true,
+        },
+      );
+
+      const result =
+        response.data?.data || {};
+
+      const recommendations =
+        Array.isArray(result.recommendations)
+          ? result.recommendations
+          : [];
+
+      setAiResults(recommendations);
+
+      setAiRunSummary({
+        totalCases: Number(result.totalCases || 0),
+        eligibleCases: Number(
+          result.eligibleCases ??
+          result.totalCases ??
+          0,
+        ),
+        skippedCases: Number(
+          result.skippedCases || 0,
+        ),
+        totalBatches: Number(
+          result.totalBatches || 0,
+        ),
+        batchSize: Number(
+          result.batchSize || 20,
+        ),
+        recommendationCount: recommendations.length,
+        geminiRequests: Number(
+          result.geminiRequests || 0,
+        ),
+        failedBatches: Number(
+          result.failedBatches || 0,
+        ),
+        fallbackRecommendations: Number(
+          result.fallbackRecommendations || 0,
+        ),
+        from: fromDate || null,
+        to: toDate || null,
+      });
+
+      if (recommendations.length === 0 && result.totalCases > 0) {
+        setAiError(
+          'AI analysis returned no recommendations for the selected recovery cases.',
+        );
+        return;
+      }
+
+      // Keep the merchant's currently selected case and all existing
+      // detail/timeline UI intact. Only refresh its timeline when needed.
+      if (selectedCase?._id) {
+        await loadTimeline(selectedCase._id);
+      }
+    } catch (requestError) {
+      console.error(
+        'Batch AI analysis error:',
+        requestError,
+      );
+
+      const statusCode =
+        requestError.response?.status;
+
+      if (statusCode === 429) {
+        setAiError(
+          'AI service is temporarily rate-limited. Please wait a little and try again.',
+        );
+        return;
+      }
+
+      if (statusCode === 401) {
+        setAiError(
+          'Your authentication session has expired. Please log in again.',
+        );
+        return;
+      }
+
+      if (statusCode === 400) {
+        setAiError(
+          requestError.response?.data?.message ||
+            'Invalid batch AI analysis request.',
+        );
+        return;
+      }
+
+      setAiError(
+        requestError.response?.data?.message ||
+          'Failed to run batch AI analysis.',
+      );
+    } finally {
+      setAiLoading(false);
+    }
+  }
 
   async function handleAIAnalysis() {
     const selectedCaseId =
@@ -564,6 +1107,246 @@ function RecoveryCases() {
       );
     } finally {
       setAiLoading(false);
+    }
+  }
+
+
+  /*
+   * --------------------------------------------------
+   * BULK EXECUTION
+   * --------------------------------------------------
+   *
+   * Execute exactly the final actions produced by the
+   * most recent batch AI run. The backend performs the
+   * authoritative current-state revalidation for every case.
+   */
+
+  function getBulkExecutionCandidates() {
+    const caseMap = new Map(
+      cases.map((item) => [String(item._id), item]),
+    );
+
+    return aiResults
+      .filter((result) => {
+        const recoveryCase = caseMap.get(
+          String(result.recoveryCaseId),
+        );
+
+        if (!recoveryCase || !result.finalAction) {
+          return false;
+        }
+
+        if (
+          TERMINAL_STATUSES.has(
+            recoveryCase.status,
+          )
+        ) {
+          return false;
+        }
+
+        if (
+          recoveryCase.status ===
+          'ACTION_EXECUTED'
+        ) {
+          return false;
+        }
+
+        return true;
+      })
+      .map((result) => ({
+        ...result,
+        recoveryCase:
+          caseMap.get(
+            String(result.recoveryCaseId),
+          ),
+      }));
+  }
+
+  function openBulkExecutionConfirmation() {
+    const candidates =
+      getBulkExecutionCandidates();
+
+    if (candidates.length === 0) {
+      setExecutionResult({
+        error:
+          'No current AI recommendations are available for bulk execution.',
+      });
+      return;
+    }
+
+    const actionCounts = candidates.reduce(
+      (counts, result) => {
+        const action =
+          result.finalAction ||
+          'UNKNOWN';
+
+        counts[action] =
+          (counts[action] || 0) + 1;
+
+        return counts;
+      },
+      {},
+    );
+
+    setBulkActionConfirmation({
+      caseIds: candidates.map(
+        (result) =>
+          String(result.recoveryCaseId),
+      ),
+      count: candidates.length,
+      actionCounts,
+    });
+
+    setExecutionResult(null);
+  }
+
+  function closeBulkExecutionConfirmation() {
+    if (bulkExecutionLoading) {
+      return;
+    }
+
+    setBulkActionConfirmation(null);
+  }
+
+  async function confirmBulkExecute() {
+    if (
+      !bulkActionConfirmation ||
+      bulkActionConfirmation.caseIds.length === 0
+    ) {
+      return;
+    }
+
+    setBulkActionConfirmation(null);
+    setBulkExecutionLoading(true);
+    setExecutionResult(null);
+
+    try {
+      const response =
+        await apiClient.post(
+          '/recovery/execute-batch',
+          {
+            recoveryCaseIds:
+              bulkActionConfirmation.caseIds,
+          },
+        );
+
+      const data =
+        response?.data?.data || {};
+
+      if (
+        response?.data?.success === false
+      ) {
+        throw new Error(
+          response?.data?.message ||
+            'Bulk recovery execution was rejected by the server.',
+        );
+      }
+
+      const results =
+        Array.isArray(data.results)
+          ? data.results
+          : [];
+
+      const resultMap = new Map(
+        results.map((item) => [
+          String(item.recoveryCaseId),
+          item,
+        ]),
+      );
+
+      setCases((currentCases) =>
+        currentCases.map((item) => {
+          const result =
+            resultMap.get(
+              String(item._id),
+            );
+
+          if (!result || !result.executed) {
+            return item;
+          }
+
+          return {
+            ...item,
+            status:
+              result.status ||
+              item.status,
+            currentAction:
+              result.action ||
+              item.currentAction,
+            actionTaken:
+              item.actionTaken ||
+              result.action ||
+              item.currentAction,
+          };
+        }),
+      );
+
+      if (selectedCase) {
+        const selectedResult =
+          resultMap.get(
+            String(selectedCase._id),
+          );
+
+        if (
+          selectedResult?.executed
+        ) {
+          const updatedSelectedCase = {
+            ...selectedCase,
+            status:
+              selectedResult.status ||
+              selectedCase.status,
+            currentAction:
+              selectedResult.action ||
+              selectedCase.currentAction,
+            actionTaken:
+              selectedCase.actionTaken ||
+              selectedResult.action ||
+              selectedCase.currentAction,
+          };
+
+          setSelectedCase(
+            updatedSelectedCase,
+          );
+
+          await loadTimeline(
+            updatedSelectedCase._id,
+          );
+
+          setPaymentLink(
+            selectedResult.paymentLink
+              ?.paymentLinkUrl
+              ? selectedResult.paymentLink
+              : null,
+          );
+        }
+      }
+
+      setExecutionResult({
+        success: true,
+        bulk: true,
+        summary:
+          data.summary || {
+            requested:
+              bulkActionConfirmation.count,
+          },
+        message:
+          'Bulk execution completed. Each recommendation was processed independently; payment confirmation is still required where applicable.',
+      });
+    } catch (requestError) {
+      console.error(
+        'Bulk recovery execution error:',
+        requestError,
+      );
+
+      setExecutionResult({
+        error:
+          requestError.response?.data
+            ?.message ||
+          requestError.message ||
+          'Failed to execute recovery actions in bulk.',
+      });
+    } finally {
+      setBulkExecutionLoading(false);
     }
   }
 
@@ -765,6 +1548,15 @@ function RecoveryCases() {
         updatedCase._id,
       );
 
+      const returnedPaymentLink =
+        execution?.paymentLink || null;
+
+      setPaymentLink(
+        returnedPaymentLink?.paymentLinkUrl
+          ? returnedPaymentLink
+          : null,
+      );
+
       if (
         execution?.blocked
       ) {
@@ -808,6 +1600,9 @@ function RecoveryCases() {
 
           status:
             nextStatus,
+
+          paymentLink:
+            returnedPaymentLink,
         });
       }
     } catch (requestError) {
@@ -830,311 +1625,27 @@ function RecoveryCases() {
 
   /*
    * --------------------------------------------------
-   * PAYMENT CONFIRMATION
+   * CUSTOMER PAYMENT LINK
    * --------------------------------------------------
    */
 
-  function handleOpenPaymentConfirmation() {
-    if (!selectedCase) {
-      return;
-    }
+  function openCustomerPaymentLink() {
+    const url =
+      paymentLink?.paymentLinkUrl;
 
-    if (
-      selectedCase.status !==
-      'ACTION_EXECUTED'
-    ) {
+    if (!url) {
       setExecutionResult({
         error:
-          'Payment confirmation is available only after a recovery action has been executed.',
+          'No customer payment link is available for this recovery action.',
       });
-
       return;
     }
 
-    const eligible =
-      Number(
-        selectedCase.eligibleAmountMinor ||
-          0,
-      );
-
-    const recovered =
-      Number(
-        selectedCase.recoveredAmountMinor ||
-          0,
-      );
-
-    const remaining =
-      Math.max(
-        eligible - recovered,
-        0,
-      );
-
-    if (remaining <= 0) {
-      setExecutionResult({
-        error:
-          'No eligible amount remains for payment confirmation.',
-      });
-
-      return;
-    }
-
-    setPaymentAmount(
-      (remaining / 100).toFixed(2),
+    window.open(
+      url,
+      '_blank',
+      'noopener,noreferrer',
     );
-
-    setPaymentTransactionId('');
-
-    setPaymentConfirmation({
-      caseId:
-        selectedCase._id,
-
-      action:
-        selectedCase.currentAction,
-
-      status:
-        selectedCase.status,
-
-      remainingAmountMinor:
-        remaining,
-    });
-
-    setExecutionResult(null);
-  }
-
-  function closePaymentConfirmation() {
-    if (executionLoading) {
-      return;
-    }
-
-    setPaymentConfirmation(null);
-  }
-
-  async function confirmPayment() {
-    if (
-      !paymentConfirmation ||
-      !selectedCase
-    ) {
-      return;
-    }
-
-    const amountRupees =
-      Number(paymentAmount);
-
-    if (
-      !Number.isFinite(amountRupees) ||
-      amountRupees <= 0
-    ) {
-      setExecutionResult({
-        error:
-          'Enter a valid recovered amount.',
-      });
-
-      return;
-    }
-
-    const recoveredAmountMinor =
-      Math.round(
-        amountRupees * 100,
-      );
-
-    if (
-      recoveredAmountMinor >
-      paymentConfirmation.remainingAmountMinor
-    ) {
-      setExecutionResult({
-        error:
-          `Recovered amount cannot exceed ${formatCurrency(
-            paymentConfirmation.remainingAmountMinor,
-          )}.`,
-      });
-
-      return;
-    }
-
-    const recoveryCaseId =
-      String(
-        paymentConfirmation.caseId,
-      );
-
-    /*
-     * Close the modal immediately after confirmation.
-     */
-    setPaymentConfirmation(null);
-
-    setExecutionLoading(true);
-    setExecutionResult(null);
-
-    try {
-      const response =
-        await apiClient.post(
-          '/recovery/confirm',
-          {
-            recoveryCaseId,
-
-            recoveredAmountMinor,
-
-            paymentTransactionId:
-              paymentTransactionId.trim() ||
-              null,
-          },
-        );
-
-      const responseBody =
-        response?.data ??
-        response ??
-        {};
-
-      const result =
-        responseBody?.data ??
-        responseBody ??
-        {};
-
-      if (
-        responseBody?.success === false
-      ) {
-        throw new Error(
-          responseBody?.message ||
-          result?.message ||
-          'Recovery confirmation was rejected by the server.',
-        );
-      }
-
-      const totalRecovered =
-        Number(
-          result.totalRecoveredAmountMinor,
-        );
-
-      const currentRecovered =
-        Number(
-          selectedCase.recoveredAmountMinor ||
-            0,
-        );
-
-      const updatedRecovered =
-        Number.isFinite(
-          totalRecovered,
-        )
-          ? totalRecovered
-          : currentRecovered +
-            recoveredAmountMinor;
-
-      const nextStatus =
-        result.status ||
-        (
-          result.fullyRecovered
-            ? 'RECOVERED'
-            : 'ACTION_EXECUTED'
-        );
-
-      const updatedCase = {
-        ...selectedCase,
-
-        recoveredAmountMinor:
-          updatedRecovered,
-
-        status:
-          nextStatus,
-
-        currentAction:
-          nextStatus ===
-          'RECOVERED'
-            ? 'STOP'
-            : selectedCase.currentAction,
-      };
-
-      setSelectedCase(
-        updatedCase,
-      );
-
-      setCases(
-        (currentCases) =>
-          currentCases.map(
-            (item) =>
-              String(item._id) ===
-              String(updatedCase._id)
-                ? {
-                    ...item,
-                    ...updatedCase,
-                  }
-                : item,
-          ),
-      );
-
-      await loadTimeline(
-        recoveryCaseId,
-      );
-
-      setExecutionResult({
-        success: true,
-
-        paymentConfirmed:
-          true,
-
-        message:
-          result.fullyRecovered
-            ? 'Payment confirmed. The full eligible revenue has been recovered.'
-            : 'Payment confirmed. Partial recovered revenue has been recorded.',
-
-        status:
-          nextStatus,
-
-        finalAction:
-          selectedCase.currentAction,
-
-        recoveredAmountMinor,
-
-        totalRecoveredAmountMinor:
-          updatedRecovered,
-
-        remainingAmountMinor:
-          result.remainingAmountMinor ??
-          Math.max(
-            Number(
-              selectedCase.eligibleAmountMinor ||
-                0,
-            ) -
-            updatedRecovered,
-            0,
-          ),
-      });
-
-      /*
-       * A fully recovered case is terminal, so remove its
-       * stale AI recommendation from the client state.
-       */
-      if (
-        nextStatus ===
-        'RECOVERED'
-      ) {
-        setAiResults(
-          (currentResults) =>
-            currentResults.filter(
-              (item) =>
-                String(
-                  item.recoveryCaseId,
-                ) !==
-                recoveryCaseId,
-            ),
-        );
-      }
-    } catch (requestError) {
-      console.error(
-        'Recovery confirmation error:',
-        requestError,
-      );
-
-      setExecutionResult({
-        error:
-          requestError.response?.data
-            ?.message ||
-          requestError.message ||
-          'Failed to confirm payment recovery.',
-      });
-    } finally {
-      setExecutionLoading(false);
-      setPaymentAmount('');
-      setPaymentTransactionId('');
-    }
   }
 
   /*
@@ -1289,6 +1800,15 @@ function RecoveryCases() {
       selectedCase?.status,
     );
 
+  const bulkExecutionCandidates =
+    getBulkExecutionCandidates();
+
+  const canBulkExecute =
+    bulkExecutionCandidates.length > 0 &&
+    !aiLoading &&
+    !bulkExecutionLoading &&
+    !executionLoading;
+
   return (
     <div className="cases-page">
 
@@ -1313,24 +1833,53 @@ function RecoveryCases() {
           </p>
         </div>
 
-        <button
-          className="primary-button"
-          onClick={
-            handleAIAnalysis
-          }
-          disabled={!canRunAI}
-          title={
-            !selectedCase
-              ? 'Select a recovery case first'
-              : selectedCaseIsTerminal
-                ? 'Terminal cases cannot be analyzed again'
-                : 'Run AI analysis for the selected case'
-          }
-        >
-          {aiLoading
-            ? 'Analyzing...'
-            : 'Run AI Analysis'}
-        </button>
+        <div className="header-actions">
+          <button
+            className="secondary-button"
+            onClick={handleBatchAIAnalysis}
+            disabled={
+              aiLoading ||
+              Boolean(
+                fromDate &&
+                toDate &&
+                fromDate > toDate,
+              )
+            }
+            title="Analyze all eligible recovery cases in the selected date range"
+          >
+            {aiLoading
+              ? 'Analyzing Batch...'
+              : 'Analyze All Eligible'}
+          </button>
+
+          <button
+            className="secondary-button bulk-execute-button"
+            onClick={openBulkExecutionConfirmation}
+            disabled={!canBulkExecute}
+            title="Execute the currently approved final action for every case in the latest batch result"
+          >
+            {bulkExecutionLoading
+              ? 'Executing...'
+              : `Execute All${bulkExecutionCandidates.length ? ` (${bulkExecutionCandidates.length})` : ''}`}
+          </button>
+
+          <button
+            className="primary-button"
+            onClick={handleAIAnalysis}
+            disabled={!canRunAI}
+            title={
+              !selectedCase
+                ? 'Select a recovery case first'
+                : selectedCaseIsTerminal
+                  ? 'Terminal cases cannot be analyzed again'
+                  : 'Run AI analysis for the selected case'
+            }
+          >
+            {aiLoading
+              ? 'Analyzing...'
+              : 'Run AI Analysis'}
+          </button>
+        </div>
       </div>
 
       {/* ==================================================
@@ -1387,6 +1936,42 @@ function RecoveryCases() {
           />
         </div>
 
+        <div className="toolbar-field">
+          <label htmlFor="analysis-from">
+            AI From
+          </label>
+
+          <input
+            id="analysis-from"
+            type="date"
+            value={fromDate}
+            onChange={(event) => {
+              setFromDate(event.target.value);
+              setAiResults([]);
+              setAiRunSummary(null);
+              setAiError('');
+            }}
+          />
+        </div>
+
+        <div className="toolbar-field">
+          <label htmlFor="analysis-to">
+            AI To
+          </label>
+
+          <input
+            id="analysis-to"
+            type="date"
+            value={toDate}
+            onChange={(event) => {
+              setToDate(event.target.value);
+              setAiResults([]);
+              setAiRunSummary(null);
+              setAiError('');
+            }}
+          />
+        </div>
+
         <button
           className="secondary-button"
           onClick={() =>
@@ -1430,18 +2015,19 @@ function RecoveryCases() {
             </strong>
 
             <span>
-              {
-                aiRunSummary.recommendationCount
-              }{' '}
-              recommendations from{' '}
-              {aiRunSummary.totalCases}{' '}
-              cases
+              {aiRunSummary.recommendationCount} recommendations from{' '}
+              {aiRunSummary.totalCases} eligible cases
+              {aiRunSummary.from || aiRunSummary.to
+                ? ` • ${aiRunSummary.from || '…'} to ${aiRunSummary.to || '…'}`
+                : ''}
             </span>
           </div>
 
           <span>
-            {aiRunSummary.totalBatches}{' '}
-            batches
+            {aiRunSummary.totalBatches} batches • {aiRunSummary.geminiRequests || 0} Gemini requests
+            {aiRunSummary.fallbackRecommendations > 0
+              ? ` • ${aiRunSummary.fallbackRecommendations} fallbacks`
+              : ''}
           </span>
 
         </div>
@@ -1748,7 +2334,10 @@ function RecoveryCases() {
             CASE DETAILS
         ================================================== */}
 
-        <aside className="case-details-card">
+        <aside
+          ref={detailsCardRef}
+          className="case-details-card"
+        >
 
           {!selectedCase ? (
             <div className="empty-state details-empty">
@@ -1997,8 +2586,7 @@ function RecoveryCases() {
                             {formatLabel(
                               sourceTransaction.paymentMethod,
                             )}
-                          </strong>
-                        </div>
+                          </strong></div>
 
                         <div>
                           <span>
@@ -2446,19 +3034,172 @@ function RecoveryCases() {
               )}
 
               {/* ==================================================
-                  PAYMENT CONFIRMATION
+                  SUCCESSFUL PAYMENT RESULT
               ================================================== */}
 
-              {selectedCaseAwaitingPayment && (
+              {paymentResult?.success &&
+                selectedCase?.status ===
+                  'RECOVERED' && (
+                <div
+                  className="payment-success-card"
+                  role="status"
+                >
+                  <div className="payment-success-heading">
+                    <div>
+                      <p className="eyebrow">
+                        PAYMENT SUCCEEDED
+                      </p>
+
+                      <h3>
+                        Recovery Payment Confirmed
+                      </h3>
+                    </div>
+
+                    <span className="payment-success-badge">
+                      Success
+                    </span>
+                  </div>
+
+                  <p className="payment-success-description">
+                    Razorpay confirmed the successful payment.
+                    The payment was recorded as a captured
+                    transaction and the eligible revenue has
+                    been marked as recovered.
+                  </p>
+
+                  <div className="payment-success-summary">
+                    <div>
+                      <span>
+                        Payment Provider
+                      </span>
+
+                      <strong>
+                        {paymentResult.provider ||
+                          'Razorpay'}
+                      </strong>
+                    </div>
+
+                    <div>
+                      <span>
+                        Payment Status
+                      </span>
+
+                      <strong>
+                        {paymentResult.paymentStatus ||
+                          'CAPTURED'}
+                      </strong>
+                    </div>
+
+                    <div>
+                      <span>
+                        Payment Amount
+                      </span>
+
+                      <strong>
+                        {formatCurrency(
+                          paymentResult.amountMinor,
+                        )}
+                      </strong>
+                    </div>
+
+                    <div>
+                      <span>
+                        Recovered Amount
+                      </span>
+
+                      <strong>
+                        {formatCurrency(
+                          paymentResult.recoveredAmountMinor,
+                        )}
+                      </strong>
+                    </div>
+
+                    <div>
+                      <span>
+                        Payment Source
+                      </span>
+
+                      <strong>
+                        {paymentResult.source ||
+                          'RAZORPAY'}
+                      </strong>
+                    </div>
+
+                    <div>
+                      <span>
+                        Currency
+                      </span>
+
+                      <strong>
+                        {paymentResult.currency ||
+                          selectedCase.currency ||
+                          'INR'}
+                      </strong>
+                    </div>
+                  </div>
+
+                  <div className="payment-success-detail">
+                    <span>
+                      Razorpay Payment ID
+                    </span>
+
+                    <strong className="mono-value">
+                      {paymentResult.razorpayPaymentId ||
+                        'Not available in audit metadata'}
+                    </strong>
+                  </div>
+
+                  <div className="payment-success-detail">
+                    <span>
+                      Recovery Transaction ID
+                    </span>
+
+                    <strong className="mono-value">
+                      {paymentResult.paymentTransactionId ||
+                        selectedCase.recoveryTransactionId ||
+                        '—'}
+                    </strong>
+                  </div>
+
+                  <div className="payment-success-detail">
+                    <span>
+                      Payment Confirmed At
+                    </span>
+
+                    <strong>
+                      {formatDateTime(
+                        paymentResult.recoveredAt,
+                      )}
+                    </strong>
+                  </div>
+
+                  <div className="payment-success-detail">
+                    <span>
+                      Case Status
+                    </span>
+
+                    <strong>
+                      RECOVERED
+                    </strong>
+                  </div>
+                </div>
+              )}
+
+              {/* ==================================================
+                  CUSTOMER PAYMENT LINK
+              ================================================== */}
+
+              {selectedCaseAwaitingPayment &&
+                paymentLink?.paymentLinkUrl && (
                 <div className="payment-confirmation-card">
                   <div className="payment-confirmation-heading">
                     <div>
                       <p className="eyebrow">
-                        PAYMENT CONFIRMATION
+                        CUSTOMER PAYMENT
                       </p>
 
                       <h3>
-                        Confirm Recovery Payment
+                        Recovery Payment Link
                       </h3>
                     </div>
 
@@ -2468,12 +3209,13 @@ function RecoveryCases() {
                   </div>
 
                   <p className="payment-confirmation-description">
-                    The recovery action has already been executed.
-                    Confirm the successful payment before this revenue
-                    is counted as recovered.
+                    The recovery action has been executed and a Razorpay
+                    payment link has been created for the customer.
+                    Revenue is not counted as recovered until Razorpay
+                    confirms successful payment.
                   </p>
 
-                  <div className="payment-confirmation-summary">
+                  <div className="payment-confirmation-summary payment-confirmation-summary-grid">
                     <div>
                       <span>
                         Recovery Action
@@ -2488,46 +3230,24 @@ function RecoveryCases() {
 
                     <div>
                       <span>
-                        Eligible Revenue
+                        Payment Amount
                       </span>
 
                       <strong>
                         {formatCurrency(
-                          selectedCase.eligibleAmountMinor,
+                          paymentLink.amountMinor,
                         )}
                       </strong>
                     </div>
 
                     <div>
                       <span>
-                        Already Recovered
+                        Link Status
                       </span>
 
                       <strong>
-                        {formatCurrency(
-                          selectedCase.recoveredAmountMinor,
-                        )}
-                      </strong>
-                    </div>
-
-                    <div>
-                      <span>
-                        Remaining
-                      </span>
-
-                      <strong>
-                        {formatCurrency(
-                          Math.max(
-                            Number(
-                              selectedCase.eligibleAmountMinor ||
-                                0,
-                            ) -
-                            Number(
-                              selectedCase.recoveredAmountMinor ||
-                                0,
-                            ),
-                            0,
-                          ),
+                        {formatLabel(
+                          paymentLink.status,
                         )}
                       </strong>
                     </div>
@@ -2537,14 +3257,41 @@ function RecoveryCases() {
                     type="button"
                     className="primary-button full-width"
                     onClick={
-                      handleOpenPaymentConfirmation
+                      openCustomerPaymentLink
                     }
                     disabled={
                       executionLoading
                     }
                   >
-                    Confirm Payment
+                    Open Customer Payment Link
                   </button>
+                </div>
+              )}
+
+              {selectedCaseAwaitingPayment &&
+                !paymentLink?.paymentLinkUrl && (
+                <div className="payment-confirmation-card">
+                  <div className="payment-confirmation-heading">
+                    <div>
+                      <p className="eyebrow">
+                        PAYMENT PENDING
+                      </p>
+
+                      <h3>
+                        Awaiting Successful Payment
+                      </h3>
+                    </div>
+
+                    <span className="payment-pending-badge">
+                      Payment Pending
+                    </span>
+                  </div>
+
+                  <p className="payment-confirmation-description">
+                    The recovery action has already been executed.
+                    Wait for the customer or payment provider to
+                    complete and confirm the payment.
+                  </p>
                 </div>
               )}
 
@@ -2602,8 +3349,9 @@ function RecoveryCases() {
                     }}
                   >
                     Do not execute another recovery action.
-                    Confirm the payment above when the payment
-                    has actually succeeded.
+                    The customer must complete payment through
+                    the Razorpay recovery link. This case will be
+                    marked recovered after a verified successful payment.
                   </span>
                 </div>
               ) : (
@@ -2630,6 +3378,105 @@ function RecoveryCases() {
               {/* ==================================================
                   ACTION CONFIRMATION MODAL
               ================================================== */}
+
+              {bulkActionConfirmation && (
+                <div
+                  className="action-modal-backdrop"
+                  role="presentation"
+                  onMouseDown={(event) => {
+                    if (
+                      event.target ===
+                      event.currentTarget
+                    ) {
+                      closeBulkExecutionConfirmation();
+                    }
+                  }}
+                >
+                  <div
+                    className="action-modal"
+                    role="dialog"
+                    aria-modal="true"
+                    aria-labelledby="bulk-execution-title"
+                    onMouseDown={(event) =>
+                      event.stopPropagation()
+                    }
+                  >
+                    <div className="action-modal-header">
+                      <div>
+                        <p className="eyebrow">
+                          BULK RECOVERY EXECUTION
+                        </p>
+
+                        <h3 id="bulk-execution-title">
+                          Execute {bulkActionConfirmation.count} Recommended Actions?
+                        </h3>
+                      </div>
+
+                      <button
+                        type="button"
+                        className="action-modal-close"
+                        onClick={closeBulkExecutionConfirmation}
+                        disabled={bulkExecutionLoading}
+                        aria-label="Close bulk execution confirmation"
+                      >
+                        ×
+                      </button>
+                    </div>
+
+                    <div className="action-modal-body">
+                      <p>
+                        The system will execute the saved, policy-approved final action for each case. No new AI analysis will run.
+                      </p>
+
+                      <div className="action-modal-summary">
+                        {Object.entries(
+                          bulkActionConfirmation.actionCounts,
+                        ).map(([action, count]) => (
+                          <div key={action}>
+                            <span>
+                              {formatLabel(action)}
+                            </span>
+                            <strong>
+                              {count}
+                            </strong>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="action-warning">
+                        <strong>
+                          Payment confirmation may still be required.
+                        </strong>
+                        <span>
+                          Executing an action does not mean revenue is recovered. Payment-link actions can remain pending until the customer completes payment, and payment retries follow the existing recovery/payment flow.
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="action-modal-footer">
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={closeBulkExecutionConfirmation}
+                        disabled={bulkExecutionLoading}
+                      >
+                        Cancel
+                      </button>
+
+                      <button
+                        type="button"
+                        className="primary-button"
+                        onClick={confirmBulkExecute}
+                        disabled={bulkExecutionLoading}
+                      >
+                        {bulkExecutionLoading
+                          ? 'Executing...'
+                          : 'Execute All Recommended Actions'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {actionConfirmation && (
                 <div
@@ -2783,209 +3630,7 @@ function RecoveryCases() {
                   PAYMENT CONFIRMATION MODAL
               ================================================== */}
 
-              {paymentConfirmation && (
-                <div
-                  className="action-modal-backdrop"
-                  role="presentation"
-                  onMouseDown={(event) => {
-                    if (
-                      event.target ===
-                      event.currentTarget
-                    ) {
-                      closePaymentConfirmation();
-                    }
-                  }}
-                >
-                  <div
-                    className="action-modal"
-                    role="dialog"
-                    aria-modal="true"
-                    aria-labelledby="payment-confirmation-title"
-                    onMouseDown={(event) =>
-                      event.stopPropagation()
-                    }
-                  >
-                    <div className="action-modal-header">
-                      <div>
-                        <p className="eyebrow">
-                          VERIFY RECOVERY PAYMENT
-                        </p>
-
-                        <h3
-                          id="payment-confirmation-title"
-                        >
-                          Confirm Payment
-                        </h3>
-                      </div>
-
-                      <button
-                        type="button"
-                        className="action-modal-close"
-                        onClick={
-                          closePaymentConfirmation
-                        }
-                        disabled={
-                          executionLoading
-                        }
-                        aria-label="Close payment confirmation"
-                      >
-                        ×
-                      </button>
-                    </div>
-
-                    <div className="action-modal-body">
-                      <p>
-                        Confirm the amount only after the customer
-                        payment has actually succeeded.
-                      </p>
-
-                      <div className="action-modal-summary">
-                        <div>
-                          <span>
-                            Case Status
-                          </span>
-
-                          <strong>
-                            {formatLabel(
-                              paymentConfirmation.status,
-                            )}
-                          </strong>
-                        </div>
-
-                        <div>
-                          <span>
-                            Recovery Action
-                          </span>
-
-                          <strong>
-                            {formatLabel(
-                              paymentConfirmation.action,
-                            )}
-                          </strong>
-                        </div>
-
-                        <div>
-                          <span>
-                            Remaining Eligible
-                          </span>
-
-                          <strong>
-                            {formatCurrency(
-                              paymentConfirmation.remainingAmountMinor,
-                            )}
-                          </strong>
-                        </div>
-                      </div>
-
-                      <div
-                        style={{
-                          marginTop: '16px',
-                          display: 'grid',
-                          gap: '12px',
-                        }}
-                      >
-                        <div className="toolbar-field">
-                          <label htmlFor="recovered-amount">
-                            Recovered Amount (₹)
-                          </label>
-
-                          <input
-                            id="recovered-amount"
-                            type="number"
-                            min="0.01"
-                            step="0.01"
-                            value={
-                              paymentAmount
-                            }
-                            onChange={(event) =>
-                              setPaymentAmount(
-                                event.target.value,
-                              )
-                            }
-                            placeholder="799.00"
-                            disabled={
-                              executionLoading
-                            }
-                          />
-                        </div>
-
-                        <div className="toolbar-field">
-                          <label htmlFor="payment-transaction-id">
-                            Payment Transaction ID
-                            <span
-                              style={{
-                                marginLeft: '5px',
-                                fontWeight: 400,
-                              }}
-                            >
-                              (optional)
-                            </span>
-                          </label>
-
-                          <input
-                            id="payment-transaction-id"
-                            type="text"
-                            value={
-                              paymentTransactionId
-                            }
-                            onChange={(event) =>
-                              setPaymentTransactionId(
-                                event.target.value,
-                              )
-                            }
-                            placeholder="Provider payment transaction ID"
-                            disabled={
-                              executionLoading
-                            }
-                          />
-                        </div>
-                      </div>
-
-                      <div className="action-warning">
-                        <strong>
-                          Payment confirmation is authoritative
-                        </strong>
-
-                        <span>
-                          Revenue will be counted as recovered only
-                          after this confirmation is accepted by
-                          the recovery service.
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="action-modal-footer">
-                      <button
-                        type="button"
-                        className="secondary-button"
-                        onClick={
-                          closePaymentConfirmation
-                        }
-                        disabled={
-                          executionLoading
-                        }
-                      >
-                        Cancel
-                      </button>
-
-                      <button
-                        type="button"
-                        className="primary-button"
-                        onClick={
-                          confirmPayment
-                        }
-                        disabled={
-                          executionLoading
-                        }
-                      >
-                        {executionLoading
-                          ? 'Confirming...'
-                          : 'Confirm Payment'}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
+            
 
             </>
           )}
