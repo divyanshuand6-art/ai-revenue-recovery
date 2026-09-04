@@ -766,7 +766,7 @@ async function persistAIAnalysis({
     policyAccepted:
       policyValidation.accepted,
 
-    risk:
+    riskLevel:
       aiRecommendation.riskLevel,
 
     provider:
