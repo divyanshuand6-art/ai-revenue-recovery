@@ -25,11 +25,11 @@ const {
 const AuditLog =
   require('../models/AuditLog');
 
-const Customer =
-  require('../models/Customer');
-
 const RecoveryCase =
   require('../models/RecoveryCase');
+
+const Customer =
+  require('../models/Customer');
 
 const Subscription =
   require('../models/Subscription');
@@ -64,7 +64,7 @@ const DATASET_END = new Date(
  * 10 source revenue-at-risk events
  *
  * Total source events = 20
- * Recovery cases = 10
+ * Recovery cases = 0 BEFORE REVENUE RISK DETECTION
  */
 const EVENT_COUNTS = Object.freeze({
   successfulPayments: 10,
@@ -156,7 +156,10 @@ function randomInt(
   );
 }
 
-function choose(random, values) {
+function choose(
+  random,
+  values,
+) {
   return values[
     randomInt(
       random,
@@ -191,7 +194,10 @@ function weightedChoose(
   return choices.at(-1).value;
 }
 
-function shuffle(random, values) {
+function shuffle(
+  random,
+  values,
+) {
   const result = [...values];
 
   for (
@@ -224,11 +230,12 @@ function dateBetween(
   start,
   end,
 ) {
-  const timestamp = randomInt(
-    random,
-    start.getTime(),
-    end.getTime(),
-  );
+  const timestamp =
+    randomInt(
+      random,
+      start.getTime(),
+      end.getTime(),
+    );
 
   return new Date(timestamp);
 }
@@ -240,20 +247,6 @@ function addMinutes(
   return new Date(
     date.getTime() +
       minutes * 60 * 1000,
-  );
-}
-
-function clamp(
-  value,
-  minimum,
-  maximum,
-) {
-  return Math.min(
-    Math.max(
-      value,
-      minimum,
-    ),
-    maximum,
   );
 }
 
@@ -599,7 +592,9 @@ function buildSubscriptions(
  * =========================================================
  */
 
-function paymentFailureDetails(random) {
+function paymentFailureDetails(
+  random,
+) {
   return weightedChoose(
     random,
     [
@@ -773,173 +768,6 @@ function subscriptionFailureDetails(
 
 /*
  * =========================================================
- * RECOVERY ACTION MAPPING
- * =========================================================
- */
-
-function recoveryActionFor(
-  caseType,
-  failureCategory,
-) {
-  if (
-    caseType ===
-    'CHECKOUT_ABANDONMENT'
-  ) {
-    return 'RECOVERY_LINK';
-  }
-
-  if (
-    failureCategory ===
-      'NETWORK_ERROR' ||
-    failureCategory ===
-      'PROCESSING_ERROR'
-  ) {
-    return 'PAYMENT_RETRY';
-  }
-
-  if (
-    failureCategory ===
-    'INSUFFICIENT_FUNDS'
-  ) {
-    return 'DELAYED_RETRY';
-  }
-
-  if (
-    failureCategory ===
-    'AUTHENTICATION_FAILED'
-  ) {
-    return 'RECOVERY_LINK';
-  }
-
-  if (
-    failureCategory ===
-      'BANK_DECLINED' ||
-    failureCategory ===
-      'MANDATE_ERROR'
-  ) {
-    return 'ALTERNATIVE_PAYMENT';
-  }
-
-  return 'FOLLOW_UP';
-}
-
-/*
- * =========================================================
- * AUDIT LOGS
- *
- * IMPORTANT:
- * NO fake AI analysis.
- * NO fake policy validation.
- * NO fake action execution.
- * NO fake payment success.
- *
- * Those happen in the real application flow.
- * =========================================================
- */
-
-function auditEventTypeFor(
-  caseType,
-) {
-  return {
-    PAYMENT_FAILURE:
-      'PAYMENT_FAILURE_DETECTED',
-
-    CHECKOUT_ABANDONMENT:
-      'CHECKOUT_ABANDONED_DETECTED',
-
-    SUBSCRIPTION_PAYMENT_FAILURE:
-      'SUBSCRIPTION_PAYMENT_FAILED',
-  }[caseType];
-}
-
-function createAuditEvents(
-  caseDocument,
-  sourceTransaction,
-) {
-  const baseTime =
-    sourceTransaction.occurredAt;
-
-  return [
-    {
-      merchantId:
-        caseDocument.merchantId,
-
-      recoveryCaseId:
-        caseDocument._id,
-
-      transactionId:
-        sourceTransaction._id,
-
-      subscriptionId:
-        caseDocument.subscriptionId,
-
-      actorType:
-        'SYSTEM',
-
-      eventType:
-        auditEventTypeFor(
-          caseDocument.type,
-        ),
-
-      result:
-        'INFO',
-
-      message:
-        'Revenue-at-risk event detected and normalized.',
-
-      metadata: {
-        amountMinor:
-          String(
-            caseDocument.amountAtRiskMinor,
-          ),
-
-        caseType:
-          caseDocument.type,
-      },
-
-      externalEventId:
-        sourceTransaction.providerEventId,
-
-      occurredAt:
-        baseTime,
-    },
-
-    {
-      merchantId:
-        caseDocument.merchantId,
-
-      recoveryCaseId:
-        caseDocument._id,
-
-      transactionId:
-        sourceTransaction._id,
-
-      subscriptionId:
-        caseDocument.subscriptionId,
-
-      actorType:
-        'SYSTEM',
-
-      eventType:
-        'RECOVERY_CASE_CREATED',
-
-      result:
-        'INFO',
-
-      message:
-        'Recovery case created and is waiting for the real AI recovery workflow.',
-
-      occurredAt:
-        addMinutes(
-          baseTime,
-          1,
-        ),
-    },
-  ];
-}
-
-/*
- * =========================================================
  * BUILD DATASET
  * =========================================================
  */
@@ -968,9 +796,15 @@ function buildDemoDataset() {
 
   const transactions = [];
 
+  /*
+   * IMPORTANT:
+   * Recovery cases are NOT created by the seed.
+   *
+   * They are created ONLY after the real
+   * Revenue Risk Detection stage analyzes
+   * these source transactions.
+   */
   const recoveryCases = [];
-
-  const auditLogs = [];
 
   const subscriptionById =
     new Map(
@@ -992,9 +826,6 @@ function buildDemoDataset() {
    * Password:
    *
    * Demo@12345
-   *
-   * bcrypt hash preserved from the existing
-   * working demo credential.
    */
 
   const merchant = {
@@ -1007,8 +838,11 @@ function buildDemoDataset() {
     email:
       DEMO_MERCHANT_EMAIL,
 
-   passwordHash:
-  bcrypt.hashSync('Demo@12345', 12),
+    passwordHash:
+      bcrypt.hashSync(
+        'Demo@12345',
+        12,
+      ),
 
     role:
       'OWNER',
@@ -1124,17 +958,10 @@ function buildDemoDataset() {
    * AT-RISK SOURCE EVENT
    * =======================================================
    *
-   * EVERY ONE OF THESE:
+   * These are ONLY source transactions.
    *
-   * status = RECOVERY_PENDING
-   * recoveredAmountMinor = 0
-   * retryAttemptCount = 0
-   * reminderCount = 0
-   * eligibleAmountMinor = full amount
-   *
-   * There is NO random recovery.
-   * There is NO recovery transaction.
-   * There is NO fake successful payment.
+   * Recovery cases will be created by
+   * revenueRiskDetectionService.js.
    */
 
   function addAtRiskEvent(
@@ -1157,10 +984,24 @@ function buildDemoDataset() {
             customerProfiles,
           );
 
+    if (!profile) {
+      throw new Error(
+        'Customer profile could not be resolved for source transaction.',
+      );
+    }
+
     const identifiers =
       sourceIdentifiers();
 
-    const occurredAt = new Date();
+    /*
+     * For Stage 1 testing, source
+     * risk events should be recent.
+     *
+     * This avoids the seeded event being
+     * already outside the recovery window.
+     */
+    const occurredAt =
+      new Date();
 
     const amountMinor =
       subscription
@@ -1203,233 +1044,83 @@ function buildDemoDataset() {
               random,
             );
 
-    const sourceTransactionId =
-      new mongoose.Types.ObjectId();
+    const sourceTransaction =
+      {
+        _id:
+          new mongoose.Types.ObjectId(),
 
-    const recoveryCaseId =
-      new mongoose.Types.ObjectId();
+        merchantId,
 
-    const failureCategory =
-      failure?.category ??
-      'UNKNOWN';
+        customerId:
+          profile.id,
 
-    /*
-     * This is only the policy/reference
-     * action used for initial case context.
-     *
-     * Actual AI recommendation will be
-     * generated after pressing Run AI Analysis.
-     */
-    const recommendedAction =
-      recoveryActionFor(
-        caseType,
-        failureCategory,
-      );
+        subscriptionId:
+          subscription?._id,
 
-    const sourceTransaction = {
-      _id:
-        sourceTransactionId,
+        type:
+          caseType ===
+          'CHECKOUT_ABANDONMENT'
+            ? 'CHECKOUT'
+            : caseType ===
+              'SUBSCRIPTION_PAYMENT_FAILURE'
+              ? 'SUBSCRIPTION_PAYMENT'
+              : 'PAYMENT',
 
-      merchantId,
+        status:
+          caseType ===
+          'CHECKOUT_ABANDONMENT'
+            ? 'ABANDONED'
+            : 'FAILED',
 
-      customerId:
-        profile.id,
-
-      subscriptionId:
-        subscription?._id,
-
-      recoveryCaseId,
-
-      type:
-        caseType ===
-        'CHECKOUT_ABANDONMENT'
-          ? 'CHECKOUT'
-          : caseType ===
-            'SUBSCRIPTION_PAYMENT_FAILURE'
-            ? 'SUBSCRIPTION_PAYMENT'
-            : 'PAYMENT',
-
-      status:
-        caseType ===
-        'CHECKOUT_ABANDONMENT'
-          ? 'ABANDONED'
-          : 'FAILED',
-
-      amountMinor,
-
-      currency:
-        'INR',
-
-      source:
-        'SYNTHETIC',
-
-      providerStatus:
-        caseType ===
-        'CHECKOUT_ABANDONMENT'
-          ? 'abandoned'
-          : 'failed',
-
-      ...identifiers,
-
-      failureCategory:
-        failure?.category,
-
-      failureCode:
-        failure?.code,
-
-      failureReason:
-        failure?.reason,
-
-      failureStage:
-        caseType ===
-        'CHECKOUT_ABANDONMENT'
-          ? 'CHECKOUT'
-          : failure?.stage,
-
-      paymentMethod:
-        caseType ===
-        'CHECKOUT_ABANDONMENT'
-          ? choose(
-              random,
-              [
-                'UPI',
-                'CARD',
-                'NETBANKING',
-              ],
-            )
-          : failure?.method,
-
-      occurredAt,
-    };
-
-    /*
-     * =====================================================
-     * FRESH RECOVERY CASE
-     * =====================================================
-     */
-
-    const recoveryCase = {
-      _id:
-        recoveryCaseId,
-
-      merchantId,
-
-      customerId:
-        profile.id,
-
-      sourceTransactionId,
-
-      subscriptionId:
-        subscription?._id,
-
-      type:
-        caseType,
-
-      /*
-       * IMPORTANT:
-       * RecoveryCase schema does NOT support
-       * ACTION_REQUIRED.
-       *
-       * Valid state is RECOVERY_PENDING.
-       */
-      status:
-        'RECOVERY_PENDING',
-
-      amountAtRiskMinor:
         amountMinor,
 
-      eligibleAmountMinor:
-        amountMinor,
+        currency:
+          'INR',
 
-      recoveredAmountMinor:
-        0,
+        source:
+          'SYNTHETIC',
 
-      currency:
-        'INR',
+        providerStatus:
+          caseType ===
+          'CHECKOUT_ABANDONMENT'
+            ? 'abandoned'
+            : 'failed',
 
-      retryAttemptCount:
-        0,
+        ...identifiers,
 
-      reminderCount:
-        0,
+        failureCategory:
+          failure?.category,
 
-      /*
-       * Keep current action as the initial
-       * deterministic policy action.
-       *
-       * AI runner will replace the agent
-       * recommendation later.
-       */
-      currentAction:
-        recommendedAction,
+        failureCode:
+          failure?.code,
 
-      nextActionAt:
-        undefined,
+        failureReason:
+          failure?.reason,
 
-      recoveryWindowEndsAt:
-        addMinutes(
-          occurredAt,
-          2880,
-        ),
+        failureStage:
+          caseType ===
+          'CHECKOUT_ABANDONMENT'
+            ? 'CHECKOUT'
+            : failure?.stage,
 
-      policySnapshot: {
-        maxPaymentRetries:
-          2,
+        paymentMethod:
+          caseType ===
+          'CHECKOUT_ABANDONMENT'
+            ? choose(
+                random,
+                [
+                  'UPI',
+                  'CARD',
+                  'NETBANKING',
+                ],
+              )
+            : failure?.method,
 
-        maxReminders:
-          2,
-
-        recoveryWindowHours:
-          48,
-      },
-
-      /*
-       * DO NOT pre-populate fake AI output.
-       *
-       * Real AI analysis will populate
-       * agentDecision when user runs it.
-       */
-      agentDecision:
-        undefined,
-
-      recoveredAt:
-        undefined,
-
-      stopReason:
-        undefined,
-
-      escalationReason:
-        undefined,
-    };
-
-    /*
-     * Subscription failure cases put the
-     * subscription into PAST_DUE and point
-     * to the active recovery case.
-     */
-    if (subscription) {
-      subscription.failureCount += 1;
-
-      subscription.status =
-        'PAST_DUE';
-
-      subscription.activeRecoveryCaseId =
-        recoveryCaseId;
-    }
+        occurredAt,
+      };
 
     transactions.push(
       sourceTransaction,
-    );
-
-    recoveryCases.push(
-      recoveryCase,
-    );
-
-    auditLogs.push(
-      ...createAuditEvents(
-        recoveryCase,
-        sourceTransaction,
-      ),
     );
   }
 
@@ -1449,8 +1140,9 @@ function buildDemoDataset() {
   }
 
   /*
-   * 4 payment failures
+   * 4 PAYMENT FAILURES
    */
+
   for (
     let index = 0;
     index <
@@ -1463,8 +1155,9 @@ function buildDemoDataset() {
   }
 
   /*
-   * 3 checkout abandonments
+   * 3 CHECKOUT ABANDONMENTS
    */
+
   for (
     let index = 0;
     index <
@@ -1477,8 +1170,9 @@ function buildDemoDataset() {
   }
 
   /*
-   * 3 subscription failures
+   * 3 SUBSCRIPTION FAILURES
    */
+
   for (
     let index = 0;
     index <
@@ -1506,8 +1200,6 @@ function buildDemoDataset() {
 
     recoveryCases,
 
-    auditLogs,
-
     sourceEventCount:
       sourceSequence - 1,
 
@@ -1519,51 +1211,21 @@ function buildDemoDataset() {
  * =========================================================
  * VALIDATION
  * =========================================================
+ *
+ * Fresh seed state:
+ *
+ * 20 transactions
+ * 10 risky transactions
+ * 0 recovery cases
+ *
+ * The actual 10 recovery cases must be
+ * created later by Revenue Risk Detection.
+ * =========================================================
  */
 
-function validateDataset(dataset) {
-  const expectedAtRiskCases =
-    EVENT_COUNTS.failedPayments +
-    EVENT_COUNTS.checkoutAbandonments +
-    EVENT_COUNTS.subscriptionFailures;
-
-  const transactionIds =
-    new Set(
-      dataset.transactions.map(
-        (transaction) =>
-          String(
-            transaction._id,
-          ),
-      ),
-    );
-
-  const recoveryTransactionIds =
-    new Set(
-      dataset.transactions
-        .filter(
-          (transaction) =>
-            transaction.providerPaymentId?.startsWith(
-              'pay_recovery_',
-            ),
-        )
-        .map(
-          (transaction) =>
-            String(
-              transaction._id,
-            ),
-        ),
-    );
-
-  const providerEventIds =
-    dataset.transactions.map(
-      (transaction) =>
-        transaction.providerEventId,
-    );
-
-  /*
-   * EXACT DATASET SIZE
-   */
-
+function validateDataset(
+  dataset,
+) {
   assert.equal(
     dataset.sourceEventCount,
     20,
@@ -1578,140 +1240,95 @@ function validateDataset(dataset) {
 
   assert.equal(
     dataset.recoveryCases.length,
-    expectedAtRiskCases,
-    'Every at-risk source event must have one recovery case.',
-  );
-
-  assert.equal(
-    dataset.recoveryCases.length,
-    10,
-    'Test dataset must contain exactly 10 recovery cases.',
-  );
-
-  /*
-   * NO SYNTHETIC RECOVERY TRANSACTIONS
-   */
-
-  assert.equal(
-    recoveryTransactionIds.size,
     0,
-    'Fresh test dataset must contain zero synthetic recovery transactions.',
+    'Fresh seeded dataset must contain zero recovery cases before risk detection.',
   );
 
-  /*
-   * UNIQUE PROVIDER EVENTS
-   */
+  const recoveryLinkedTransactions =
+    dataset.transactions.filter(
+      (transaction) =>
+        transaction.recoveryCaseId,
+    );
 
   assert.equal(
-    new Set(
-      providerEventIds,
-    ).size,
+    recoveryLinkedTransactions.length,
+    0,
+    'Fresh seeded transactions must not be linked to recovery cases.',
+  );
+
+  const providerEventIds =
+    dataset.transactions.map(
+      (transaction) =>
+        transaction.providerEventId,
+    );
+
+  assert.equal(
+    new Set(providerEventIds).size,
     providerEventIds.length,
     'Provider event identifiers must be unique.',
   );
 
-  /*
-   * AUDIT TRAIL
-   */
-
-  assert.ok(
-    dataset.auditLogs.length >=
-      dataset.recoveryCases.length *
-        2,
-    'Every case needs detection and creation audit logs.',
-  );
-
-  /*
-   * =======================================================
-   * EVERY RECOVERY CASE MUST BE FRESH
-   * =======================================================
-   */
-
-  for (
-    const recoveryCase
-    of dataset.recoveryCases
-  ) {
-    assert.ok(
-      transactionIds.has(
-        String(
-          recoveryCase.sourceTransactionId,
+  const riskySourceTransactions =
+    dataset.transactions.filter(
+      (transaction) =>
+        (
+          transaction.status ===
+            'FAILED' &&
+          [
+            'PAYMENT',
+            'SUBSCRIPTION_PAYMENT',
+          ].includes(
+            transaction.type,
+          )
+        ) ||
+        (
+          transaction.status ===
+            'ABANDONED' &&
+          transaction.type ===
+            'CHECKOUT'
         ),
-      ),
-      'Case source transaction must exist.',
-    );
-
-    assert.equal(
-      recoveryCase.status,
-      'RECOVERY_PENDING',
-      'Every fresh case must start in RECOVERY_PENDING.',
-    );
-
-    assert.equal(
-      recoveryCase.recoveredAmountMinor,
-      0,
-      'Fresh case must have zero recovered amount.',
-    );
-
-    assert.equal(
-      recoveryCase.retryAttemptCount,
-      0,
-      'Fresh case must have zero retry attempts.',
-    );
-
-    assert.equal(
-      recoveryCase.reminderCount,
-      0,
-      'Fresh case must have zero reminders.',
-    );
-
-    assert.equal(
-      recoveryCase.eligibleAmountMinor,
-      recoveryCase.amountAtRiskMinor,
-      'Fresh case must have the full amount eligible.',
-    );
-
-    assert.equal(
-      recoveryCase.recoveryTransactionId,
-      undefined,
-      'Fresh case must not have a recovery transaction.',
-    );
-
-    assert.equal(
-      recoveryCase.recoveredAt,
-      undefined,
-      'Fresh case must not have a recoveredAt timestamp.',
-    );
-
-    assert.equal(
-      recoveryCase.stopReason,
-      undefined,
-      'Fresh case must not have a stop reason.',
-    );
-
-    assert.equal(
-      recoveryCase.escalationReason,
-      undefined,
-      'Fresh case must not have an escalation reason.',
-    );
-  }
-
-  /*
-   * ABSOLUTE GUARANTEE:
-   * 0 cases start RECOVERED.
-   */
-
-  const recoveredCases =
-    dataset.recoveryCases.filter(
-      (recoveryCase) =>
-        recoveryCase.status ===
-        'RECOVERED',
     );
 
   assert.equal(
-    recoveredCases.length,
-    0,
-    'Fresh dataset must contain zero RECOVERED cases.',
+    riskySourceTransactions.length,
+    10,
+    'Fresh seeded dataset must contain exactly 10 risky source transactions for Stage 1 detection.',
   );
+
+  /*
+   * Every risky source event must carry
+   * enough evidence for risk detection.
+   */
+
+  for (
+    const transaction
+      of riskySourceTransactions
+  ) {
+    assert.ok(
+      transaction.amountMinor > 0,
+      'Every risky source transaction must have a positive amount.',
+    );
+
+    assert.ok(
+      transaction.customerId,
+      'Every risky source transaction must have a customer.',
+    );
+
+    assert.ok(
+      transaction.occurredAt,
+      'Every risky source transaction must have occurredAt.',
+    );
+
+    if (
+      transaction.status ===
+        'FAILED'
+    ) {
+      assert.ok(
+        transaction.failureCategory,
+        'Every failed risky transaction must contain failureCategory.',
+      );
+    }
+  }
 }
 
 /*
@@ -1771,23 +1388,23 @@ function summarizeDataset(
     recoveredCases:
       recoveredCases.length,
 
-    auditLogs:
-      dataset.auditLogs.length,
-
     revenueAtRiskMinor,
 
     revenueRecoveredMinor,
 
     recoveryRatePercent:
-      Number(
-        (
-          (
-            recoveredCases.length /
-            dataset.recoveryCases.length
-          ) *
-          100
-        ).toFixed(2),
-      ),
+      dataset.recoveryCases.length >
+      0
+        ? Number(
+            (
+              (
+                recoveredCases.length /
+                dataset.recoveryCases.length
+              ) *
+              100
+            ).toFixed(2),
+          )
+        : 0,
   };
 }
 
@@ -1831,6 +1448,13 @@ async function removeExistingDemoData() {
  * =========================================================
  * PERSIST DATASET
  * =========================================================
+ *
+ * IMPORTANT:
+ * RecoveryCase collection is intentionally
+ * NOT populated here.
+ *
+ * Stage 1 will create RecoveryCases.
+ * =========================================================
  */
 
 async function persistDataset(
@@ -1845,17 +1469,7 @@ async function persistDataset(
     Transaction.init(),
 
     Subscription.init(),
-
-    RecoveryCase.init(),
-
-    AuditLog.init(),
   ]);
-
-  /*
-   * Since this is a fresh isolated test
-   * dataset, --reset is the explicit
-   * replacement mechanism.
-   */
 
   if (!shouldReset) {
     const existingMerchant =
@@ -1897,20 +1511,6 @@ async function persistDataset(
 
   await Transaction.insertMany(
     dataset.transactions,
-    {
-      ordered: true,
-    },
-  );
-
-  await RecoveryCase.insertMany(
-    dataset.recoveryCases,
-    {
-      ordered: true,
-    },
-  );
-
-  await AuditLog.insertMany(
-    dataset.auditLogs,
     {
       ordered: true,
     },
@@ -1957,12 +1557,14 @@ async function main() {
     );
 
   /*
+   * =======================================================
    * DRY RUN
+   * =======================================================
    */
 
   if (isDryRun) {
     console.info(
-      'Fresh 10-case synthetic dataset dry run passed. No database records were written.',
+      'Fresh 20-transaction seed dry run passed. No database records were written.',
     );
 
     console.info(
@@ -1977,7 +1579,9 @@ async function main() {
   }
 
   /*
+   * =======================================================
    * DATABASE
+   * =======================================================
    */
 
   configureDnsServers();
@@ -1998,7 +1602,7 @@ async function main() {
     );
 
     console.info(
-      'Fresh 10-case synthetic demo dataset created successfully.',
+      'Fresh 20-transaction demo dataset created successfully. Recovery cases will be created by revenue risk detection.',
     );
 
     console.info(

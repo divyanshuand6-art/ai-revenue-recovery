@@ -7,6 +7,8 @@ const {
   decideAndExecuteRecovery,
   executeRecoveryCasesInBulkController,
   confirmRecoveryController,
+   simulateRecoveryPaymentController,
+  analyzeTransactionsForRevenueRiskController,
 } = require('../controllers/recoveryController');
 
 const {
@@ -75,6 +77,12 @@ router.post(
 router.post(
   '/confirm',
   confirmRecoveryController,
+);
+
+router.post(
+  '/analyze-transactions',
+  requireAuth,
+  analyzeTransactionsForRevenueRiskController,
 );
 
 module.exports = router;

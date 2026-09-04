@@ -26,6 +26,158 @@ const {
 const {
   executeRecoveryCasesInBulk,
 } = require('../services/bulkRecoveryExecutionService');
+
+const {
+  analyzeTransactionsForRevenueRisk,
+} = require('../services/revenueRiskDetectionService');
+
+
+ /**
+  * POST /api/recovery/analyze-transactions
+  *
+  * Stage 1:
+  *
+  * ALL TRANSACTIONS
+  *        ↓
+  * REVENUE RISK DETECTION
+  *        ↓
+  * RISKY TRANSACTIONS
+  *        ↓
+  * RECOVERY CASE CREATION
+  *
+  * IMPORTANT:
+  * - No Gemini call
+  * - No AI recommendation
+  * - No policy execution
+  * - No payment
+  */
+async function analyzeTransactionsForRevenueRiskController(
+  req,
+  res,
+) {
+  try {
+    const merchantId =
+      req.user?.userId;
+
+    if (!merchantId) {
+      return res.status(401).json({
+        success: false,
+        message:
+          'Authenticated merchant could not be resolved.',
+      });
+    }
+
+    const {
+      from,
+      to,
+      limit = 500,
+    } = req.body || {};
+
+    /*
+     * Validate optional dates.
+     */
+    if (
+      from !== undefined &&
+      from !== null &&
+      from !== '' &&
+      !/^\d{4}-\d{2}-\d{2}$/.test(
+        String(from),
+      )
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'from must use YYYY-MM-DD format.',
+      });
+    }
+
+    if (
+      to !== undefined &&
+      to !== null &&
+      to !== '' &&
+      !/^\d{4}-\d{2}-\d{2}$/.test(
+        String(to),
+      )
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'to must use YYYY-MM-DD format.',
+      });
+    }
+
+    if (
+      from &&
+      to &&
+      String(from) > String(to)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'from cannot be later than to.',
+      });
+    }
+
+    const parsedLimit =
+      Number(limit);
+
+    if (
+      !Number.isInteger(
+        parsedLimit,
+      ) ||
+      parsedLimit <= 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'limit must be a positive integer.',
+      });
+    }
+
+    const result =
+      await analyzeTransactionsForRevenueRisk({
+        merchantId,
+
+        from:
+          from || undefined,
+
+        to:
+          to || undefined,
+
+        limit:
+          parsedLimit,
+      });
+
+    return res.status(200).json({
+      success: true,
+
+      data: result,
+    });
+  } catch (error) {
+    console.error(
+      'Revenue risk detection error:',
+      error,
+    );
+
+    if (
+      error.name ===
+      'CastError'
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'Invalid transaction or merchant identifier.',
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      message:
+        error.message ||
+        'Failed to analyze transactions for revenue risk.',
+    });
+  }
+}
 /**
  * GET /api/recovery/cases
  */
@@ -1321,6 +1473,7 @@ async function executeRecoveryCasesInBulkController(
   }
 }
 module.exports = {
+   analyzeTransactionsForRevenueRiskController,
   getRecoveryCases,
   getRecoveryCaseTimeline,
   runAIRecoveryAnalysisController,
