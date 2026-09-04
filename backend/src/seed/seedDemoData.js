@@ -1160,12 +1160,7 @@ function buildDemoDataset() {
     const identifiers =
       sourceIdentifiers();
 
-    const occurredAt =
-      dateBetween(
-        random,
-        DATASET_START,
-        DATASET_END,
-      );
+    const occurredAt = new Date();
 
     const amountMinor =
       subscription

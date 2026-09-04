@@ -1107,12 +1107,10 @@ async function runAIRecoveryAnalysis({
 
   if (recoveryCaseId) {
     const recoveryCase =
-      await RecoveryCase.findOne({
-        _id:
-          recoveryCaseId,
-
-        merchantId,
-      }).lean();
+  await RecoveryCase.findOne({
+    _id: recoveryCaseId,
+    merchantId,
+  });
 
     if (!recoveryCase) {
       const error =
