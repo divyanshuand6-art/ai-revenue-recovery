@@ -1,10 +1,11 @@
 import { useState } from 'react';
 import apiClient from '../api/client';
+import './Login.css';
 
 function Login({ onLogin }) {
-  const [email, setEmail] = useState(
-    'demo.merchant@ai-revenue-recovery.local',
-  );
+const [email, setEmail] = useState(
+  'demo@revenue-recovery.test',
+);
 
   const [password, setPassword] = useState(
     'Demo@12345',
