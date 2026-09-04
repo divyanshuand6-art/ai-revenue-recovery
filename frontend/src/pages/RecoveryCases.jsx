@@ -134,8 +134,10 @@ function RecoveryCases() {
   const [aiLoading, setAiLoading] =
     useState(false);
 
-  const [aiResults, setAiResults] =
-    useState([]);
+    const [riskAnalysisLoading, setRiskAnalysisLoading] = useState(false);
+
+ const [aiResults, setAiResults] = useState([]);
+const [bulkAIResults, setBulkAIResults] = useState([]);
 
   const [aiRunSummary, setAiRunSummary] =
     useState(null);
@@ -271,6 +273,7 @@ function RecoveryCases() {
       setSourceTransaction(null);
 
       setAiResults([]);
+      setBulkAIResults([]);
       setAiRunSummary(null);
       setAiError('');
 
@@ -774,6 +777,7 @@ function RecoveryCases() {
     timelineRef.current = [];
 
     setAiResults([]);
+    setBulkAIResults([]);
     setAiRunSummary(null);
     setAiError('');
 
@@ -802,6 +806,42 @@ function RecoveryCases() {
    * the AI response is received.
    * --------------------------------------------------
    */
+
+  async function handleTransactionRiskAnalysis() {
+  try {
+    setRiskAnalysisLoading(true);
+    setError('');
+
+    const response = await apiClient.post(
+      '/recovery/analyze-transactions',
+      {}
+    );
+
+    const result = response.data?.data || {};
+
+    setSelectedCase(null);
+    setAiResults([]);
+    setBulkAIResults([]);
+    setAiRunSummary(null);
+    setExecutionResult(null);
+    setPaymentLink(null);
+    setPaymentResult(null);
+
+    // Reload recovery cases created by Stage 1
+    await loadCases();
+
+    console.log('Transaction risk analysis completed:', result);
+  } catch (error) {
+    console.error('Transaction risk analysis failed:', error);
+
+    setError(
+      error.response?.data?.message ||
+      'Transaction risk analysis failed. Please try again.'
+    );
+  } finally {
+    setRiskAnalysisLoading(false);
+  }
+}
 
   async function handleBatchAIAnalysis() {
     if (fromDate && toDate && fromDate > toDate) {
@@ -836,6 +876,7 @@ function RecoveryCases() {
           : [];
 
       setAiResults(recommendations);
+      setBulkAIResults(recommendations);
 
       setAiRunSummary({
         totalCases: Number(result.totalCases || 0),
@@ -1122,7 +1163,7 @@ function RecoveryCases() {
    */
 
   function getBulkExecutionCandidates() {
-  return aiResults
+  return bulkAIResults
     .filter((result) => {
       if (
         !result ||
@@ -1258,6 +1299,8 @@ function RecoveryCases() {
           };
         }),
       );
+
+      await loadCases(status);
 
       if (selectedCase) {
         const selectedResult =
@@ -1813,6 +1856,16 @@ function RecoveryCases() {
 
         <div className="header-actions">
           <button
+  className="secondary-button"
+  onClick={handleTransactionRiskAnalysis}
+  disabled={riskAnalysisLoading}
+  title="Analyze all transactions and create recovery cases for risky transactions"
+>
+  {riskAnalysisLoading
+    ? 'Analyzing Transactions...'
+    : 'Analyze Transactions'}
+</button>
+          <button
             className="secondary-button"
             onClick={handleBatchAIAnalysis}
             disabled={
@@ -1926,6 +1979,7 @@ function RecoveryCases() {
             onChange={(event) => {
               setFromDate(event.target.value);
               setAiResults([]);
+              setBulkAIResults([]);
               setAiRunSummary(null);
               setAiError('');
             }}
@@ -1944,6 +1998,7 @@ function RecoveryCases() {
             onChange={(event) => {
               setToDate(event.target.value);
               setAiResults([]);
+              setBulkAIResults([]);
               setAiRunSummary(null);
               setAiError('');
             }}
@@ -3357,105 +3412,6 @@ function RecoveryCases() {
                   ACTION CONFIRMATION MODAL
               ================================================== */}
 
-              {bulkActionConfirmation && (
-                <div
-                  className="action-modal-backdrop"
-                  role="presentation"
-                  onMouseDown={(event) => {
-                    if (
-                      event.target ===
-                      event.currentTarget
-                    ) {
-                      closeBulkExecutionConfirmation();
-                    }
-                  }}
-                >
-                  <div
-                    className="action-modal"
-                    role="dialog"
-                    aria-modal="true"
-                    aria-labelledby="bulk-execution-title"
-                    onMouseDown={(event) =>
-                      event.stopPropagation()
-                    }
-                  >
-                    <div className="action-modal-header">
-                      <div>
-                        <p className="eyebrow">
-                          BULK RECOVERY EXECUTION
-                        </p>
-
-                        <h3 id="bulk-execution-title">
-                          Execute {bulkActionConfirmation.count} Recommended Actions?
-                        </h3>
-                      </div>
-
-                      <button
-                        type="button"
-                        className="action-modal-close"
-                        onClick={closeBulkExecutionConfirmation}
-                        disabled={bulkExecutionLoading}
-                        aria-label="Close bulk execution confirmation"
-                      >
-                        ×
-                      </button>
-                    </div>
-
-                    <div className="action-modal-body">
-                      <p>
-                        The system will execute the saved, policy-approved final action for each case. No new AI analysis will run.
-                      </p>
-
-                      <div className="action-modal-summary">
-                        {Object.entries(
-                          bulkActionConfirmation.actionCounts,
-                        ).map(([action, count]) => (
-                          <div key={action}>
-                            <span>
-                              {formatLabel(action)}
-                            </span>
-                            <strong>
-                              {count}
-                            </strong>
-                          </div>
-                        ))}
-                      </div>
-
-                      <div className="action-warning">
-                        <strong>
-                          Payment confirmation may still be required.
-                        </strong>
-                        <span>
-                          Executing an action does not mean revenue is recovered. Payment-link actions can remain pending until the customer completes payment, and payment retries follow the existing recovery/payment flow.
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="action-modal-footer">
-                      <button
-                        type="button"
-                        className="secondary-button"
-                        onClick={closeBulkExecutionConfirmation}
-                        disabled={bulkExecutionLoading}
-                      >
-                        Cancel
-                      </button>
-
-                      <button
-                        type="button"
-                        className="primary-button"
-                        onClick={confirmBulkExecute}
-                        disabled={bulkExecutionLoading}
-                      >
-                        {bulkExecutionLoading
-                          ? 'Executing...'
-                          : 'Execute All Recommended Actions'}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
-
               {actionConfirmation && (
                 <div
                   className="action-modal-backdrop"
@@ -3616,6 +3572,106 @@ function RecoveryCases() {
         </aside>
 
       </div>
+
+              {bulkActionConfirmation && (
+                <div
+                  className="action-modal-backdrop"
+                  role="presentation"
+                  onMouseDown={(event) => {
+                    if (
+                      event.target ===
+                      event.currentTarget
+                    ) {
+                      closeBulkExecutionConfirmation();
+                    }
+                  }}
+                >
+                  <div
+                    className="action-modal"
+                    role="dialog"
+                    aria-modal="true"
+                    aria-labelledby="bulk-execution-title"
+                    onMouseDown={(event) =>
+                      event.stopPropagation()
+                    }
+                  >
+                    <div className="action-modal-header">
+                      <div>
+                        <p className="eyebrow">
+                          BULK RECOVERY EXECUTION
+                        </p>
+
+                        <h3 id="bulk-execution-title">
+                          Execute {bulkActionConfirmation.count} Recommended Actions?
+                        </h3>
+                      </div>
+
+                      <button
+                        type="button"
+                        className="action-modal-close"
+                        onClick={closeBulkExecutionConfirmation}
+                        disabled={bulkExecutionLoading}
+                        aria-label="Close bulk execution confirmation"
+                      >
+                        ×
+                      </button>
+                    </div>
+
+                    <div className="action-modal-body">
+                      <p>
+                        The system will execute the saved, policy-approved final action for each case. No new AI analysis will run.
+                      </p>
+
+                      <div className="action-modal-summary">
+                        {Object.entries(
+                          bulkActionConfirmation.actionCounts,
+                        ).map(([action, count]) => (
+                          <div key={action}>
+                            <span>
+                              {formatLabel(action)}
+                            </span>
+                            <strong>
+                              {count}
+                            </strong>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="action-warning">
+                        <strong>
+                          Payment confirmation may still be required.
+                        </strong>
+                        <span>
+                          Executing an action does not mean revenue is recovered. Payment-link actions can remain pending until the customer completes payment, and payment retries follow the existing recovery/payment flow.
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="action-modal-footer">
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={closeBulkExecutionConfirmation}
+                        disabled={bulkExecutionLoading}
+                      >
+                        Cancel
+                      </button>
+
+                      <button
+                        type="button"
+                        className="primary-button"
+                        onClick={confirmBulkExecute}
+                        disabled={bulkExecutionLoading}
+                      >
+                        {bulkExecutionLoading
+                          ? 'Executing...'
+                          : 'Execute All Recommended Actions'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
     </div>
   );
 }
