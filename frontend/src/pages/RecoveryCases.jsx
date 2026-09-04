@@ -821,8 +821,8 @@ function RecoveryCases() {
           from: fromDate || undefined,
           to: toDate || undefined,
           status: status === 'ALL' ? 'ALL' : status,
-          limit: 5000,
-          batchSize: 20,
+          limit: 100,
+          batchSize: 10,
           activeOnly: true,
         },
       );
@@ -1122,45 +1122,23 @@ function RecoveryCases() {
    */
 
   function getBulkExecutionCandidates() {
-    const caseMap = new Map(
-      cases.map((item) => [String(item._id), item]),
-    );
+  return aiResults
+    .filter((result) => {
+      if (
+        !result ||
+        !result.recoveryCaseId ||
+        !result.finalAction
+      ) {
+        return false;
+      }
 
-    return aiResults
-      .filter((result) => {
-        const recoveryCase = caseMap.get(
-          String(result.recoveryCaseId),
-        );
-
-        if (!recoveryCase || !result.finalAction) {
-          return false;
-        }
-
-        if (
-          TERMINAL_STATUSES.has(
-            recoveryCase.status,
-          )
-        ) {
-          return false;
-        }
-
-        if (
-          recoveryCase.status ===
-          'ACTION_EXECUTED'
-        ) {
-          return false;
-        }
-
-        return true;
-      })
-      .map((result) => ({
-        ...result,
-        recoveryCase:
-          caseMap.get(
-            String(result.recoveryCaseId),
-          ),
-      }));
-  }
+      return true;
+    })
+    .map((result) => ({
+      ...result,
+      recoveryCase: null,
+    }));
+}
 
   function openBulkExecutionConfirmation() {
     const candidates =
